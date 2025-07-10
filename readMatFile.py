@@ -24,6 +24,15 @@ r = lambda a, b: sum([1 for x in [a] if (x-b).total_seconds() > 0])
 if r(datetime.now(), q()):
     st.stop()
 
+def first_nonempty_comment(series):
+    """Return the first non-empty comment in a series, or empty string if none."""
+    for c in series:
+        if pd.notna(c) and str(c).strip() != '':
+            return c
+    return ""
+
+
+
 def sec_to_mmss_millis(seconds):
     if not np.isfinite(seconds):
         return ""
@@ -247,9 +256,18 @@ if uploaded_mat:
                 df_sorted = df.sort_values('time_s').copy()
                 t0 = df_sorted['time_s'].iloc[0]
                 df_sorted['time_bin'] = ((df_sorted['time_s'] - t0) // bin_seconds).astype(int)
+                # agg = df_sorted.groupby('time_bin').agg(
+                #     {**{c: 'mean' for c in all_signals}, 'time_s': 'first', 'time_mmss_millis': 'first'}
+                # ).reset_index()
+
                 agg = df_sorted.groupby('time_bin').agg(
-                    {**{c: 'mean' for c in all_signals}, 'time_s': 'first', 'time_mmss_millis': 'first'}
+                    {**{c: 'mean' for c in all_signals}, 
+                    'time_s': 'first', 
+                    'time_mmss_millis': 'first',
+                    'comment': first_nonempty_comment}
                 ).reset_index()
+
+
                 agg['bin_start_time'] = t0 + agg['time_bin'] * bin_seconds
 
                 st.session_state.df = df
@@ -304,7 +322,10 @@ if uploaded_mat:
                 t0 = df_sorted['time_s'].iloc[0]
                 df_sorted['time_bin'] = ((df_sorted['time_s'] - t0) // bin_seconds).astype(int)
                 agg = df_sorted.groupby('time_bin').agg(
-                    {main_signal: 'mean', 'time_s': 'first', 'time_mmss_millis': 'first'}
+                    {main_signal: 'mean', 'time_s': 'first',
+                      'time_mmss_millis': 'first',
+                        'comment': first_nonempty_comment 
+                      }
                 ).reset_index()
                 agg['bin_start_time'] = t0 + agg['time_bin'] * bin_seconds
 
@@ -321,7 +342,15 @@ if 'result_df' in st.session_state:
     result_df = st.session_state.result_df
     all_signals = st.session_state.all_signals
 
-    csv = result_df.to_csv(index=False).encode('utf-8')
+    csvdf = result_df.drop(columns=['time_bin', 'bin_start_time'])
+    csvdf.rename(columns={'time_s': 'Time (sec)', 'time_mmss_millis': 'Time (mm:ss.ms)'}, inplace=True)
+
+    #reorder columns to have time first
+    csvdf = csvdf[['Time (sec)', 'Time (mm:ss.ms)'] + [col for col in csvdf.columns if col not in ['Time (sec)', 'Time (mm:ss.ms)']]]
+
+    csv = csvdf.to_csv(index=False).encode('utf-8')
+
+
     file_base = uploaded_mat.name.split('.')[0]
     st.download_button("Download Resampled CSV", csv, f"{file_base}_{bin_choice}_resampled.csv", "text/csv")
 
