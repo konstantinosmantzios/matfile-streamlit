@@ -31,8 +31,6 @@ def first_nonempty_comment(series):
             return c
     return ""
 
-
-
 def sec_to_mmss_millis(seconds):
     if not np.isfinite(seconds):
         return ""
@@ -125,9 +123,20 @@ def load_mat_file(mat_file) -> pd.DataFrame:
     print(df)
     return df
 
+# ------- Jump Filter Implementation -------
+def apply_jump_filter(sig, time, jumpval=10, indxval=30):
+    sig = np.array(sig)
+    sig_masked = sig.copy()
+    jumps_idx = np.where(np.abs(np.diff(sig)) > jumpval)[0] + 1
+    sig_masked[jumps_idx] = np.nan
+    for i in range(len(jumps_idx) - 1):
+        start = jumps_idx[i]
+        end = jumps_idx[i + 1]
+        if (end - start) < indxval:
+            sig_masked[start:end+1] = np.nan
+    return sig_masked
 
 uploaded_mat = st.file_uploader("Upload a MATLAB .mat file", type=["mat"])
-
 
 # Clear session state on new upload
 if uploaded_mat:
@@ -166,7 +175,6 @@ if uploaded_mat:
         st.error("No suitable signals found with data ('1: Finger Pressure' or 'Channel 18').")
         st.stop()
 
-
     st.markdown("### Settings")
     bin_choice = st.radio("Sample Rate", [
         "500ms", "1 sec", "2 sec", "5 sec", "10 sec", "15 sec", "30 sec", "1 min"
@@ -179,19 +187,39 @@ if uploaded_mat:
 
     # Only show the filtering controls if '1: Finger Pressure' is present
     if main_signal == priority_signal:
-        with st.expander("Finger Pressure Filtering Settings", expanded=True):
-            seconds = st.slider("Window (sec)", 0.05, 1.0, 0.15, step=0.05)
-            pivot_window = int(seconds * 200)
-            high_threshold = st.slider("High Threshold", 0, 1000, 250)
+        with st.expander("Finger Pressure Filtering Settings", expanded=False):  # <-- collapsed by default
+            filter_method_fp = st.radio(
+                "Filter Method",
+                ["Standard (local min/max)", "Jump Filter"],
+                index=1,  # <-- default to Jump Filter
+                horizontal=True,
+                key="fp_filter_method"
+            )
+            if filter_method_fp == "Standard (local min/max)":
+                seconds = st.slider("Window (sec)", 0.05, 1.0, 0.15, step=0.05, key="fp_window")
+                pivot_window = int(seconds * 200)
+                high_threshold = st.slider("High Threshold", 0, 1000, 250, key="fp_high_thr")
+            elif filter_method_fp == "Jump Filter":
+                jumpval_fp = st.slider("Jump Threshold (Δ)", 5, 100, 30, step=5, key="fp_jumpval")
+                indxval_fp = st.slider("Close Jump Window (samples)", 10, 1000, 500, step=10, key="fp_indxval")
 
-    # Channel 18 Filtering Parameters (always present if file is uploaded)
     if uploaded_mat and 'Channel 18' in all_columns:
-        with st.expander("### Channel 18 Filtering Settings", expanded=True):
-            ch18_order = st.slider("Pivot Detection Window (order)", min_value=10, max_value=200, value=30, step=5)
-            ch18_limit = st.slider("High % Limit for Filtering", min_value=10, max_value=300, value=180, step=5)
+        with st.expander("### Channel 18 Filtering Settings", expanded=False):  # <-- collapsed by default
+            filter_method_ch18 = st.radio(
+                "Filter Method",
+                ["Standard (local min/max)", "Jump Filter"],
+                index=1,  # <-- default to Jump Filter
+                horizontal=True,
+                key="ch18_filter_method"
+            )
+            if filter_method_ch18 == "Standard (local min/max)":
+                ch18_order = st.slider("Pivot Detection Window (order)", min_value=10, max_value=200, value=30, step=5, key="ch18_order")
+                ch18_limit = st.slider("High % Limit for Filtering", min_value=10, max_value=300, value=180, step=5, key="ch18_limit")
+            elif filter_method_ch18 == "Jump Filter":
+                jumpval_ch18 = st.slider("Jump Threshold (Δ)", 5, 100, 10, step=5, key="ch18_jumpval")
+                indxval_ch18 = st.slider("Close Jump Window (samples)", 10, 1000, 200, step=10, key="ch18_indxval")
     else:
-        ch18_order, ch18_limit = 30, 180  # Defaults, just in case
-
+        ch18_order, ch18_limit, jumpval_ch18, indxval_ch18 = 30, 180, 10, 200
 
     if st.button("Convert and Resample"):
         with st.spinner("Converting and resampling... Please wait."):
@@ -200,124 +228,129 @@ if uploaded_mat:
                 if '11: AutoCal Countdown' in df.columns:
                     mask = df['11: AutoCal Countdown'] < 0.5
                     for col in all_signals:
-
                         if col == 'Channel 18':
-                            df['unfiltered_signal_Ch_18'] = df['Channel 18'].copy()
-                            # Filter Channel 18 using custom logic
-                            signal = df[col].values
-                            time = df['time_s'].values
-                            pivot_high_idx = argrelextrema(signal, np.greater, order=ch18_order)[0]
-                            pivot_low_idx  = argrelextrema(signal, np.less,    order=ch18_order)[0]
-                            indices_to_nan = []
-                            last_low = None
-                            last_low_val = None
-                            li = 0
-
-                            for hi in pivot_high_idx:
-                                while li < len(pivot_low_idx) and pivot_low_idx[li] < hi:
-                                    last_low = pivot_low_idx[li]
-                                    last_low_val = signal[last_low]
-                                    li += 1
-                                if last_low is not None and last_low_val != 0:
-                                    pct = 100 * (signal[hi] - last_low_val) / abs(last_low_val)
-                                    future_lows = pivot_low_idx[pivot_low_idx > hi]
-                                    if pct > ch18_limit and len(future_lows) > 0:
-                                        next_low = future_lows[0]
-                                        indices_to_nan.extend(range(last_low, next_low + 1))
-
-                            filtered_signal = signal.copy()
-                            if indices_to_nan:
-                                filtered_signal[indices_to_nan] = np.nan
-                            df[col] = filtered_signal
-
-
+                            # Filtering Channel 18 with settings (handled below)
+                            pass
                         else:
                             df.loc[mask, col] = np.nan
 
-                # Filtering based on local minima/maxima and high threshold
-                signal_fp = main_signal
-                valid_df = df[['time_s', signal_fp]].dropna().reset_index(drop=True)
-                geq_vec = np.vectorize(lambda a, b: a >= b, otypes=[np.bool_])
-                leq_vec = np.vectorize(lambda a, b: a <= b, otypes=[np.bool_])
-                pivot_highs_idx = argrelextrema(valid_df[signal_fp].values, comparator=geq_vec, order=pivot_window)[0]
-                pivot_lows_idx = argrelextrema(valid_df[signal_fp].values, comparator=leq_vec, order=pivot_window)[0]
-                pivot_highs = valid_df.loc[pivot_highs_idx].reset_index(drop=True)
-                pivot_lows = valid_df.loc[pivot_lows_idx].reset_index(drop=True)
+                # -------- FILTER FINGER PRESSURE BASED ON USER CHOICE --------
+                if filter_method_fp == "Jump Filter":
+                    df[main_signal] = apply_jump_filter(
+                        df[main_signal].values,
+                        df['time_s'].values,
+                        jumpval=jumpval_fp,
+                        indxval=indxval_fp
+                    )
+                else:
+                    signal_fp = main_signal
+                    valid_df = df[['time_s', signal_fp]].dropna().reset_index(drop=True)
+                    geq_vec = np.vectorize(lambda a, b: a >= b, otypes=[np.bool_])
+                    leq_vec = np.vectorize(lambda a, b: a <= b, otypes=[np.bool_])
+                    pivot_highs_idx = argrelextrema(valid_df[signal_fp].values, comparator=geq_vec, order=pivot_window)[0]
+                    pivot_lows_idx = argrelextrema(valid_df[signal_fp].values, comparator=leq_vec, order=pivot_window)[0]
+                    pivot_highs = valid_df.loc[pivot_highs_idx].reset_index(drop=True)
+                    pivot_lows = valid_df.loc[pivot_lows_idx].reset_index(drop=True)
 
-                filtered_signal = df[signal_fp].copy()
-                for i in range(len(pivot_lows) - 1):
-                    low_start = pivot_lows.loc[i, 'time_s']
-                    low_end = pivot_lows.loc[i + 1, 'time_s']
-                    highs_between = pivot_highs[(pivot_highs['time_s'] > low_start) & (pivot_highs['time_s'] < low_end)]
-                    if not highs_between.empty and (highs_between[signal_fp] > high_threshold).any():
-                        filtered_signal[(df['time_s'] > low_start) & (df['time_s'] < low_end)] = np.nan
-                df[signal_fp] = filtered_signal
+                    filtered_signal = df[signal_fp].copy()
+                    for i in range(len(pivot_lows) - 1):
+                        low_start = pivot_lows.loc[i, 'time_s']
+                        low_end = pivot_lows.loc[i + 1, 'time_s']
+                        highs_between = pivot_highs[(pivot_highs['time_s'] > low_start) & (pivot_highs['time_s'] < low_end)]
+                        if not highs_between.empty and (highs_between[signal_fp] > high_threshold).any():
+                            filtered_signal[(df['time_s'] > low_start) & (df['time_s'] < low_end)] = np.nan
+                    df[signal_fp] = filtered_signal
+
+                # Channel 18: Handle separately if present in columns (with its own filter settings)
+                if 'Channel 18' in all_signals:
+                    if 'filter_method_ch18' in locals() and filter_method_ch18 == "Jump Filter":
+                        df['unfiltered_signal_Ch_18'] = df['Channel 18'].copy()
+                        df['Channel 18'] = apply_jump_filter(
+                            df['Channel 18'].values,
+                            df['time_s'].values,
+                            jumpval=jumpval_ch18,
+                            indxval=indxval_ch18
+                        )
+                    else:
+                        df['unfiltered_signal_Ch_18'] = df['Channel 18'].copy()
+                        signal = df['Channel 18'].values
+                        time = df['time_s'].values
+                        pivot_high_idx = argrelextrema(signal, np.greater, order=ch18_order)[0]
+                        pivot_low_idx = argrelextrema(signal, np.less, order=ch18_order)[0]
+                        indices_to_nan = []
+                        last_low = None
+                        last_low_val = None
+                        li = 0
+
+                        for hi in pivot_high_idx:
+                            while li < len(pivot_low_idx) and pivot_low_idx[li] < hi:
+                                last_low = pivot_low_idx[li]
+                                last_low_val = signal[last_low]
+                                li += 1
+                            if last_low is not None and last_low_val != 0:
+                                pct = 100 * (signal[hi] - last_low_val) / abs(last_low_val)
+                                future_lows = pivot_low_idx[pivot_low_idx > hi]
+                                if pct > ch18_limit and len(future_lows) > 0:
+                                    next_low = future_lows[0]
+                                    indices_to_nan.extend(range(last_low, next_low + 1))
+
+                        filtered_signal = signal.copy()
+                        if indices_to_nan:
+                            filtered_signal[indices_to_nan] = np.nan
+                        df['Channel 18'] = filtered_signal
 
                 df_sorted = df.sort_values('time_s').copy()
                 t0 = df_sorted['time_s'].iloc[0]
                 df_sorted['time_bin'] = ((df_sorted['time_s'] - t0) // bin_seconds).astype(int)
-                # agg = df_sorted.groupby('time_bin').agg(
-                #     {**{c: 'mean' for c in all_signals}, 'time_s': 'first', 'time_mmss_millis': 'first'}
-                # ).reset_index()
-
                 agg = df_sorted.groupby('time_bin').agg(
                     {**{c: 'mean' for c in all_signals}, 
                     'time_s': 'first', 
                     'time_mmss_millis': 'first',
                     'comment': first_nonempty_comment}
                 ).reset_index()
-
-
                 agg['bin_start_time'] = t0 + agg['time_bin'] * bin_seconds
 
                 st.session_state.df = df
                 st.session_state.result_df = agg
                 st.session_state.all_signals = all_signals
 
-            # elif main_signal == fallback_signal:
-            #     df['unfiltered_signal'] = df[main_signal].copy()
-            #     df_sorted = df.sort_values('time_s').copy()
-            #     t0 = df_sorted['time_s'].iloc[0]
-            #     df_sorted['time_bin'] = ((df_sorted['time_s'] - t0) // bin_seconds).astype(int)
-            #     agg = df_sorted.groupby('time_bin').agg(
-            #         {main_signal: 'mean', 'time_s': 'first', 'time_mmss_millis': 'first'}
-            #     ).reset_index()
-            #     agg['bin_start_time'] = t0 + agg['time_bin'] * bin_seconds
-
-            #     st.session_state.df = df
-            #     st.session_state.result_df = agg
-            #     st.session_state.all_signals = [main_signal]
-
             elif main_signal == fallback_signal:
-                # Filter Channel 18 with selected settings
-                signal = df[main_signal].values
-                time = df['time_s'].values
-                pivot_high_idx = argrelextrema(signal, np.greater, order=ch18_order)[0]
-                pivot_low_idx  = argrelextrema(signal, np.less,    order=ch18_order)[0]
-                indices_to_nan = []
-                last_low = None
-                last_low_val = None
-                li = 0
+                # Channel 18
+                if filter_method_ch18 == "Jump Filter":
+                    filtered_signal = apply_jump_filter(
+                        df[main_signal].values,
+                        df['time_s'].values,
+                        jumpval=jumpval_ch18,
+                        indxval=indxval_ch18
+                    )
+                else:
+                    signal = df[main_signal].values
+                    time = df['time_s'].values
+                    pivot_high_idx = argrelextrema(signal, np.greater, order=ch18_order)[0]
+                    pivot_low_idx  = argrelextrema(signal, np.less,    order=ch18_order)[0]
+                    indices_to_nan = []
+                    last_low = None
+                    last_low_val = None
+                    li = 0
 
-                for hi in pivot_high_idx:
-                    while li < len(pivot_low_idx) and pivot_low_idx[li] < hi:
-                        last_low = pivot_low_idx[li]
-                        last_low_val = signal[last_low]
-                        li += 1
-                    if last_low is not None and last_low_val != 0:
-                        pct = 100 * (signal[hi] - last_low_val) / abs(last_low_val)
-                        future_lows = pivot_low_idx[pivot_low_idx > hi]
-                        if pct > ch18_limit and len(future_lows) > 0:
-                            next_low = future_lows[0]
-                            indices_to_nan.extend(range(last_low, next_low + 1))
+                    for hi in pivot_high_idx:
+                        while li < len(pivot_low_idx) and pivot_low_idx[li] < hi:
+                            last_low = pivot_low_idx[li]
+                            last_low_val = signal[last_low]
+                            li += 1
+                        if last_low is not None and last_low_val != 0:
+                            pct = 100 * (signal[hi] - last_low_val) / abs(last_low_val)
+                            future_lows = pivot_low_idx[pivot_low_idx > hi]
+                            if pct > ch18_limit and len(future_lows) > 0:
+                                next_low = future_lows[0]
+                                indices_to_nan.extend(range(last_low, next_low + 1))
+                    filtered_signal = signal.copy()
+                    if indices_to_nan:
+                        filtered_signal[indices_to_nan] = np.nan
 
-                filtered_signal = signal.copy()
-                if indices_to_nan:
-                    filtered_signal[indices_to_nan] = np.nan
                 df['unfiltered_signal_Ch_18'] = df[main_signal].copy()
                 df[main_signal] = filtered_signal
 
-                # Aggregation for resampling (same as before)
                 df_sorted = df.sort_values('time_s').copy()
                 t0 = df_sorted['time_s'].iloc[0]
                 df_sorted['time_bin'] = ((df_sorted['time_s'] - t0) // bin_seconds).astype(int)
@@ -333,9 +366,6 @@ if uploaded_mat:
                 st.session_state.result_df = agg
                 st.session_state.all_signals = [main_signal]
 
-
-
-
 # === Visualization Phase (runs even after convert)
 if 'result_df' in st.session_state:
     df = st.session_state.df
@@ -350,7 +380,6 @@ if 'result_df' in st.session_state:
 
     csv = csvdf.to_csv(index=False).encode('utf-8')
 
-
     file_base = uploaded_mat.name.split('.')[0]
     st.download_button("Download Resampled CSV", csv, f"{file_base}_{bin_choice}_resampled.csv", "text/csv")
 
@@ -364,7 +393,7 @@ if 'result_df' in st.session_state:
             line=dict(color='rgba(200,200,200,0.5)', width=1)
         ))
     elif plot_signal in ['1: Finger Pressure', '3: Systolic',	'4: Mean Arterial',	'5: Diastolic']:
-            fig.add_trace(go.Scatter(
+        fig.add_trace(go.Scatter(
             x=df['time_s'], y=df['unfiltered_signal'], mode='lines', name='Unfiltered',
             line=dict(color='rgba(200,200,200,0.5)', width=1)
         ))
