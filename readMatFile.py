@@ -983,6 +983,7 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
                         sheet_name = f"Resampled({selected_label})"
                         resampled.to_excel(writer, index=False, sheet_name=sheet_name[:31])
 
+
             buffer.seek(0)
             st.download_button(
                 label="Download Excel",
