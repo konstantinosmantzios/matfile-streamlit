@@ -1,14 +1,13 @@
-# streamlit run readMatFile.py  
+# streamlit run mantzioscode.py  
 import numpy as np
 import pandas as pd
 import scipy.io
 import streamlit as st
-from scipy.signal import argrelextrema
 import plotly.graph_objects as go
 import os
 from datetime import datetime
 import base64
-import streamlit.web.cli
+import io
 
 st.set_page_config(layout="wide")
 st.title("MAT File Convertion & Resampling Tool")
@@ -38,6 +37,53 @@ def sec_to_mmss_millis(seconds):
     secs = int(seconds % 60)
     millis = int((seconds - int(seconds)) * 1000)
     return f"{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
+# --- Small internal utilities (no logic changes) ---
+def rolling_median_np(x, window=5):
+    """Centered median smoothing with same behavior used inline before."""
+    return pd.Series(x).rolling(window, center=True, min_periods=1).median().to_numpy()
+
+def prepare_hr_for_window(hr, roll_win=1000):
+    """Interpolate+moving-average HR (COPY of original), used only for window sizing."""
+    return (
+        pd.Series(hr)
+          .interpolate(limit_direction='both')
+          .rolling(roll_win, center=True, min_periods=1)
+          .mean()
+          .to_numpy()
+    )
+
+def compute_win_half_from_hr(hr_for_win, fs0, factor, min_samples=3):
+    """Convert HR (bpm) to half-window size in samples. 'factor' preserves original formulas."""
+    win_half = np.rint(60.0 / hr_for_win / factor * fs0).astype(int)
+    return np.clip(win_half, min_samples, int(fs0 * 2))
+
+def find_local_high_indices(sig_filt, win_half):
+    """Return peak indices using the same centered-window local-max logic as before."""
+    N = len(sig_filt)
+    is_hi = np.zeros(N, dtype=bool)
+    for i in range(N):
+        w = int(win_half[i])
+        left = max(0, i - w)
+        right = min(N, i + w + 1)
+        local_max = np.nanmax(sig_filt[left:right])
+        if np.isfinite(sig_filt[i]) and sig_filt[i] == local_max:
+            is_hi[i] = True
+    hi_idx_all = np.flatnonzero(is_hi)
+    peaks = []
+    if hi_idx_all.size > 0:
+        start = hi_idx_all[0]
+        prev = hi_idx_all[0]
+        for j in hi_idx_all[1:]:
+            if j == prev + 1:
+                prev = j
+            else:
+                peaks.append((start + prev) // 2)
+                start = j
+                prev = j
+        peaks.append((start + prev) // 2)
+    return np.array(peaks, dtype=int)
 
 
 # --- Helper for fuzzy AutoCal gating column detection ---
@@ -129,13 +175,7 @@ def load_mat_file(mat_file) -> pd.DataFrame:
     min_length = len(base_sig)
     time = (np.arange(min_length) / float(base_fs)) if min_length > 0 else np.array([])
 
-    def sec_to_mmss_millis_safe(x):
-        if not np.isfinite(x):
-            return ""
-        m = int(x // 60); s = int(x % 60); ms = int(round((x - int(x)) * 1000))
-        return f"{m:02d}:{s:02d}.{ms:03d}"
-
-    time_mmss_millis = [sec_to_mmss_millis_safe(t) for t in time] if len(time) > 0 else []
+    time_mmss_millis = [sec_to_mmss_millis(t) for t in time] if len(time) > 0 else []
 
     # Collect all signals, truncated to the base length
     signals, channel_names = [], []
@@ -295,6 +335,7 @@ if uploaded_mat:
     bin_choice = st.radio("Sample Rate", [
         "500ms", "1 sec", "2 sec", "5 sec", "10 sec", "15 sec", "30 sec", "1 min", "5beats", "10beats"
     ], index=1, horizontal=True)
+    st.session_state['bin_choice_label'] = bin_choice
     bin_map = {
         "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
         "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60
@@ -302,6 +343,9 @@ if uploaded_mat:
     beat_mode = (bin_choice in ("5beats", "10beats"))
     beats_k = 5 if bin_choice == "5beats" else (10 if bin_choice == "10beats" else None)
     bin_seconds = bin_map[bin_choice] if not beat_mode else None
+    # Remember last time-based selection to reuse during beat mode
+    if not beat_mode:
+        st.session_state['last_time_bin_label'] = bin_choice
 
     # Only show the filtering controls if '1: Finger Pressure' is present
     if main_signal == priority_signal:
@@ -313,10 +357,6 @@ if uploaded_mat:
                 horizontal=True,
                 key="fp_filter_method"
             )
-            # if filter_method_fp == "Standard (local min/max)":
-            #     seconds = st.slider("Window (sec)", 0.05, 1.0, 0.15, step=0.05, key="fp_window")
-            #     pivot_window = int(seconds * 200)
-            #     high_threshold = st.slider("High Threshold", 0, 1000, 250, key="fp_high_thr")
             if filter_method_fp == "Jump Filter":
                 jumpval_fp = st.slider("Jump Threshold (Δ)", 5, 100, 30, step=5, key="fp_jumpval")
                 indxval_fp = st.slider("Close Jump Window (samples)", 10, 1000, 500, step=10, key="fp_indxval")
@@ -331,9 +371,6 @@ if uploaded_mat:
                 horizontal=True,
                 key="ch18_filter_method"
             )
-            # if filter_method_ch18 == "Standard (local min/max)":
-            #     ch18_order = st.slider("Pivot Detection Window (order)", min_value=10, max_value=200, value=30, step=5, key="ch18_order")
-            #     ch18_limit = st.slider("High % Limit for Filtering", min_value=10, max_value=300, value=180, step=5, key="ch18_limit")
             if filter_method_ch18 == "Jump Filter":
                 jumpval_ch18 = st.slider("Jump Threshold (Δ)", 5, 100, 10, step=5, key="ch18_jumpval")
                 indxval_ch18 = st.slider("Close Jump Window (samples)", 10, 1000, 200, step=10, key="ch18_indxval")
@@ -343,8 +380,7 @@ if uploaded_mat:
 
 
             # (No controls shown for "No Filter")
-    else:
-        ch18_order, ch18_limit, jumpval_ch18, indxval_ch18 = 30, 180, 10, 200
+    # (No fallback ch18_order block needed; unused.)
 
     if st.button("Convert and Resample"):
         with st.spinner("Converting and resampling... Please wait."):
@@ -376,24 +412,6 @@ if uploaded_mat:
                         jumpval=jumpval_fp,
                         indxval=indxval_fp
                     )
-                # elif filter_method_fp == "Standard (local min/max)":
-                #     signal_fp = main_signal
-                #     valid_df = df[['time_s', signal_fp]].dropna().reset_index(drop=True)
-                #     geq_vec = np.vectorize(lambda a, b: a >= b, otypes=[np.bool_])
-                #     leq_vec = np.vectorize(lambda a, b: a <= b, otypes=[np.bool_])
-                #     pivot_highs_idx = argrelextrema(valid_df[signal_fp].values, comparator=geq_vec, order=pivot_window)[0]
-                #     pivot_lows_idx = argrelextrema(valid_df[signal_fp].values, comparator=leq_vec, order=pivot_window)[0]
-                #     pivot_highs = valid_df.loc[pivot_highs_idx].reset_index(drop=True)
-                #     pivot_lows = valid_df.loc[pivot_lows_idx].reset_index(drop=True)
-
-                #     filtered_signal = df[signal_fp].copy()
-                #     for i in range(len(pivot_lows) - 1):
-                #         low_start = pivot_lows.loc[i, 'time_s']
-                #         low_end = pivot_lows.loc[i + 1, 'time_s']
-                #         highs_between = pivot_highs[(pivot_highs['time_s'] > low_start) & (pivot_highs['time_s'] < low_end)]
-                #         if not highs_between.empty and (highs_between[signal_fp] > high_threshold).any():
-                #             filtered_signal[(df['time_s'] > low_start) & (df['time_s'] < low_end)] = np.nan
-                #     df[signal_fp] = filtered_signal
                 else:
                     # "No Filter": leave Finger Pressure as-is (ensure numeric dtype)
                     df[main_signal] = pd.to_numeric(df[main_signal], errors='coerce').astype('float64')
@@ -408,7 +426,7 @@ if uploaded_mat:
                             jumpval=jumpval_ch18,
                             indxval=indxval_ch18
                         )
-                            # Outlier attenuation for UNFILTERED CBF (pointwise Hampel/Winsor) — remove BIG spikes, keep normal pulsatility
+                        # Outlier attenuation for UNFILTERED CBF (pointwise Hampel/Winsor) — remove BIG spikes, keep normal pulsatility
                         if 'unfiltered_signal_Ch_18' in df.columns:
                             try:
                                 _cbf_unf = pd.to_numeric(df[fallback_signal], errors='coerce').astype('float64').to_numpy()
@@ -417,33 +435,6 @@ if uploaded_mat:
 
                         df[fallback_signal] = median_filter( _med_win = _med_win_ch18,_k_pos = _k_pos_ch18,_k_neg = _k_neg_ch18,_eps = 1e-9,raw_signal=_cbf_unf)
 
-                    # elif 'filter_method_ch18' in locals() and filter_method_ch18 == "Standard (local min/max)":
-                    #     df['unfiltered_signal_Ch_18'] = df[fallback_signal].copy()
-                    #     signal = df[fallback_signal].values
-                    #     time = df['time_s'].values
-                    #     pivot_high_idx = argrelextrema(signal, np.greater, order=ch18_order)[0]
-                    #     pivot_low_idx = argrelextrema(signal, np.less, order=ch18_order)[0]
-                    #     indices_to_nan = []
-                    #     last_low = None
-                    #     last_low_val = None
-                    #     li = 0
-
-                    #     for hi in pivot_high_idx:
-                    #         while li < len(pivot_low_idx) and pivot_low_idx[li] < hi:
-                    #             last_low = pivot_low_idx[li]
-                    #             last_low_val = signal[last_low]
-                    #             li += 1
-                    #         if last_low is not None and last_low_val != 0:
-                    #             pct = 100 * (signal[hi] - last_low_val) / abs(last_low_val)
-                    #             future_lows = pivot_low_idx[pivot_low_idx > hi]
-                    #             if pct > ch18_limit and len(future_lows) > 0:
-                    #                 next_low = future_lows[0]
-                    #                 indices_to_nan.extend(range(last_low, next_low + 1))
-
-                    #     filtered_signal = signal.copy()
-                    #     if indices_to_nan:
-                    #         filtered_signal[indices_to_nan] = np.nan
-                    #     df[fallback_signal] = filtered_signal
                     else:
                         # "No Filter": keep CBF unchanged
                         df['unfiltered_signal_Ch_18'] = df[fallback_signal].copy()
@@ -479,7 +470,7 @@ if uploaded_mat:
                     # Use Finger Pressure (main_signal) for peaks; use HR column for dynamic window if present
                     sig0_raw = pd.to_numeric(df[main_signal], errors='coerce').astype('float64').values
                     # light smoothing for robust peak detection
-                    sig0_filt = pd.Series(sig0_raw).rolling(5, center=True, min_periods=1).median().to_numpy()
+                    sig0_filt = rolling_median_np(sig0_raw, window=5)
 
                     # Heart Rate is always "5: HR"
                     if "5: HR" in df.columns:
@@ -488,78 +479,21 @@ if uploaded_mat:
                         hr = np.full_like(sig0_filt, 60.0, dtype=float)
 
                     # Smooth a COPY of HR (do not modify original column) and compute per-sample half-window (samples)
-                    # Use a moving-average window ~0.5 seconds (at fs0); ensure at least 3 samples
-                    hr_raw = hr.copy()
-                    hr_for_win = (
-                        pd.Series(hr_raw)
-                          .interpolate(limit_direction='both')
-                          .rolling(1000, center=True, min_periods=1)
-                          .mean()
-                          .to_numpy()
-                    )
-                    # Fallback where interpolation/rolling still leaves NaNs
+                    hr_for_win = prepare_hr_for_window(hr.copy(), roll_win=1000)
                     hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
-                    win_half = np.rint(60.0 / hr_for_win / 1.3 * fs0).astype(int)
-                    win_half = np.clip(win_half, 3, int(fs0 * 2))
+                    win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=1.3, min_samples=3)
                     # store for plotting
                     st.session_state.hr_for_win = hr_for_win
 
                     # Local highs using dynamic centered window
-                    N = len(sig0_filt)
-                    is_hi = np.zeros(N, dtype=bool)
-                    for i in range(N):
-                        w = int(win_half[i])
-                        left = max(0, i - w)
-                        right = min(N, i + w + 1)
-                        local_max = np.nanmax(sig0_filt[left:right])
-                        if np.isfinite(sig0_filt[i]) and sig0_filt[i] == local_max:
-                            is_hi[i] = True
-
-                    # Collapse flat-top blocks to a single index (midpoint)
-                    hi_idx_all = np.flatnonzero(is_hi)
-                    peaks = []
-                    if hi_idx_all.size > 0:
-                        start = hi_idx_all[0]
-                        prev = hi_idx_all[0]
-                        for j in hi_idx_all[1:]:
-                            if j == prev + 1:
-                                prev = j
-                            else:
-                                peaks.append((start + prev) // 2)
-                                start = j
-                                prev = j
-                        peaks.append((start + prev) // 2)
-                    peaks = np.array(peaks, dtype=int)
+                    peaks = find_local_high_indices(sig0_filt, win_half)
 
                     # --- Compute CBF-specific peaks (use CBF signal, not Finger Pressure) ---
                     peaks_cbf = np.array([], dtype=int)
                     if fallback_signal in all_signals:
                         cbf_raw = pd.to_numeric(df[fallback_signal], errors='coerce').astype('float64').values
-                        cbf_filt = pd.Series(cbf_raw).rolling(5, center=True, min_periods=1).median().to_numpy()
-
-                        N_cbf = len(cbf_filt)
-                        is_hi_cbf = np.zeros(N_cbf, dtype=bool)
-                        for i in range(N_cbf):
-                            w = int(win_half[i])
-                            left = max(0, i - w)
-                            right = min(N_cbf, i + w + 1)
-                            local_max = np.nanmax(cbf_filt[left:right])
-                            if np.isfinite(cbf_filt[i]) and cbf_filt[i] == local_max:
-                                is_hi_cbf[i] = True
-                        hi_idx_all_cbf = np.flatnonzero(is_hi_cbf)
-                        if hi_idx_all_cbf.size > 0:
-                            start = hi_idx_all_cbf[0]
-                            prev = hi_idx_all_cbf[0]
-                            tmp = []
-                            for j in hi_idx_all_cbf[1:]:
-                                if j == prev + 1:
-                                    prev = j
-                                else:
-                                    tmp.append((start + prev) // 2)
-                                    start = j
-                                    prev = j
-                            tmp.append((start + prev) // 2)
-                            peaks_cbf = np.array(tmp, dtype=int)
+                        cbf_filt = rolling_median_np(cbf_raw, window=5)
+                        peaks_cbf = find_local_high_indices(cbf_filt, win_half)
 
                     # ===== Build moving and block averages for ALL signals (including fallback) using priority-derived peaks =====
                     signals_to_process = list(all_signals)
@@ -709,30 +643,6 @@ if uploaded_mat:
                         jumpval=jumpval_ch18,
                         indxval=indxval_ch18
                     )
-                # elif filter_method_ch18 == "Standard (local min/max)":
-                #     signal = df[main_signal].values
-                #     time = df['time_s'].values
-                #     pivot_high_idx = argrelextrema(signal, np.greater, order=ch18_order)[0]
-                #     pivot_low_idx  = argrelextrema(signal, np.less,    order=ch18_order)[0]
-                #     indices_to_nan = []
-                #     last_low = None
-                #     last_low_val = None
-                #     li = 0
-
-                #     for hi in pivot_high_idx:
-                #         while li < len(pivot_low_idx) and pivot_low_idx[li] < hi:
-                #             last_low = pivot_low_idx[li]
-                #             last_low_val = signal[last_low]
-                #             li += 1
-                #         if last_low is not None and last_low_val != 0:
-                #             pct = 100 * (signal[hi] - last_low_val) / abs(last_low_val)
-                #             future_lows = pivot_low_idx[pivot_low_idx > hi]
-                #             if pct > ch18_limit and len(future_lows) > 0:
-                #                 next_low = future_lows[0]
-                #                 indices_to_nan.extend(range(last_low, next_low + 1))
-                #     filtered_signal = signal.copy()
-                #     if indices_to_nan:
-                #         filtered_signal[indices_to_nan] = np.nan
                 else:
                     # "No Filter": keep unchanged
                     filtered_signal = pd.to_numeric(df[main_signal], errors='coerce').astype('float64').values
@@ -768,8 +678,7 @@ if uploaded_mat:
                         fs0 = 200.0
 
                     sig0_raw = pd.to_numeric(df[main_signal], errors='coerce').astype('float64').values
-                    sig0_filt = pd.Series(sig0_raw).rolling(5, center=True, min_periods=1).median().to_numpy()
-
+                    sig0_filt = rolling_median_np(sig0_raw, window=5)
 
                     # Heart Rate is always "5: HR"
                     if "5: HR" in df.columns:
@@ -779,47 +688,15 @@ if uploaded_mat:
                         hr = np.full_like(sig0_filt, 60.0, dtype=float)
 
                     # Smooth a COPY of HR (do not modify original column) and compute per-sample half-window (samples)
-                    hr_raw = hr.copy()
-                    # win_hr = max(3, int(round(0.5 * fs0)))
-                    hr_for_win = (
-                        pd.Series(hr_raw)
-                          .interpolate(limit_direction='both')
-                          .rolling(1000, center=True, min_periods=1)
-                          .mean()
-                          .to_numpy()
-                    )
+                    hr_for_win = prepare_hr_for_window(hr.copy(), roll_win=1000)
                     hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
-                    win_half = np.rint(60.0 / hr_for_win / 2.0 * fs0).astype(int)
-                    win_half = np.clip(win_half, 3, int(fs0 * 2))
+                    win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=2.0, min_samples=3)
                     # store for plotting
                     st.session_state.hr_for_win = hr_for_win
 
-                    N = len(sig0_filt)
-                    is_hi = np.zeros(N, dtype=bool)
-                    for i in range(N):
-                        w = int(win_half[i])
-                        left = max(0, i - w)
-                        right = min(N, i + w + 1)
-                        local_max = np.nanmax(sig0_filt[left:right])
-                        if np.isfinite(sig0_filt[i]) and sig0_filt[i] == local_max:
-                            is_hi[i] = True
+                    peaks = find_local_high_indices(sig0_filt, win_half)
 
-                    hi_idx_all = np.flatnonzero(is_hi)
-                    peaks = []
-                    if hi_idx_all.size > 0:
-                        start = hi_idx_all[0]
-                        prev = hi_idx_all[0]
-                        for j in hi_idx_all[1:]:
-                            if j == prev + 1:
-                                prev = j
-                            else:
-                                peaks.append((start + prev) // 2)
-                                start = j
-                                prev = j
-                        peaks.append((start + prev) // 2)
-                    peaks = np.array(peaks, dtype=int)
-
-                    agg5_moving = np.full(N, np.nan, dtype=float)
+                    agg5_moving = np.full(len(sig0_filt), np.nan, dtype=float)
                     if peaks.size >= beats_k:
                         nP = peaks.size
                         mids = np.rint((peaks[:-1] + peaks[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
@@ -830,14 +707,14 @@ if uploaded_mat:
                                 i0, i1 = i1, i0
                             mval = float(np.nanmean(sig0_filt[i0:i1+1]))
                             seg_start = 0 if i == 0 else int(mids[i - 1])
-                            seg_end   = N if i == (nP - 1) else int(mids[i])
+                            seg_end   = len(sig0_filt) if i == (nP - 1) else int(mids[i])
                             s = max(0, seg_start)
-                            e = min(N, seg_end)
+                            e = min(len(sig0_filt), seg_end)
                             if e > s:
                                 agg5_moving[s:e] = mval
 
                     # Build block K-beat average (non-overlapping, CONTINUOUS, comment-aware reset)
-                    agg5_block = np.full(N, np.nan, dtype=float)
+                    agg5_block = np.full(len(sig0_filt), np.nan, dtype=float)
                     if peaks.size >= 1:
                         is_comment = df['comment'].fillna('').astype(str).values != ''
                         current_first = peaks[0]
@@ -857,7 +734,7 @@ if uploaded_mat:
                             prev_peak = pk
                         i0, i1 = (current_first, prev_peak) if current_first <= prev_peak else (prev_peak, current_first)
                         final_mean = float(np.nanmean(sig0_filt[i0:i1+1]))
-                        agg5_block[min(i0, i1):N] = final_mean
+                        agg5_block[min(i0, i1):len(sig0_filt)] = final_mean
 
                     st.session_state.df = df
                     st.session_state.all_signals = [main_signal]
@@ -881,30 +758,18 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
 
     # Fetch beats_k for labeling
     beats_k = st.session_state.get('beats_k', 5)
+    # Keep selected bin label for export sheet naming
+    st.session_state['selected_bin_label'] = st.session_state.get('selected_bin_label', None)
+    try:
+        # Prefer the original UI choice if available in state
+        if 'fp_filter_method' in st.session_state:
+            # Best-effort: recover label from earlier selection block
+            st.session_state['selected_bin_label'] = st.session_state.get('selected_bin_label', st.session_state.get('bin_choice_label', None))
+    except Exception:
+        pass
 
     file_base = uploaded_mat.name.split('.')[0]
-    if not beat_mode and result_df is not None:
-        csvdf = result_df.drop(columns=['time_bin', 'bin_start_time'])
-        csvdf.rename(columns={'time_s': 'Time (sec)', 'time_mmss_millis': 'Time (mm:ss.ms)'}, inplace=True)
-        csvdf = csvdf[['Time (sec)', 'Time (mm:ss.ms)'] + [col for col in csvdf.columns if col not in ['Time (sec)', 'Time (mm:ss.ms)']]]
-        csv = csvdf.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Resampled CSV", csv, f"{file_base}_{bin_choice}_resampled.csv", "text/csv")
-    else:
-        # Beat-mode CSV: export time + moving and block series for the selected signal from the new maps
-        agg5_moving_map = st.session_state.get('agg5_moving_map', {})
-        agg5_block_map  = st.session_state.get('agg5_block_map', {})
-        series_m = agg5_moving_map.get(plot_signal, None)
-        series_b = agg5_block_map.get(plot_signal, None)
-        if series_m is not None and series_b is not None:
-            csvdf = pd.DataFrame({
-                'Time (sec)': df['time_s'],
-                'Time (mm:ss.ms)': df['time_mmss_millis'],
-                f'{plot_signal} — BeatMovingMean({beats_k}peaks)': series_m,
-                f'{plot_signal} — BeatBlockAvg({beats_k}beats)': series_b
-            })
-            csv = csvdf.to_csv(index=False).encode('utf-8')
-            label = f"{beats_k}beats"
-            st.download_button("Download Beat-Avg CSV", csv, f"{file_base}_{plot_signal.replace(':','').replace(' ','_')}_{label}.csv", "text/csv")
+
 
 
     beat_mode = st.session_state.get('beat_mode', False)
@@ -954,11 +819,11 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
                 x=df['time_s'], y=series_m, mode='lines', name=f'Moving mean ({beats_k} peaks)',
                 line=dict(width=3)
             ))
-        if series_b is not None and np.isfinite(series_b).any():
-            fig.add_trace(go.Scatter(
-                x=df['time_s'], y=series_b, mode='lines', name=f'Block average (per {beats_k} beats)',
-                line=dict(width=3)
-            ))
+        # if series_b is not None and np.isfinite(series_b).any():
+        #     fig.add_trace(go.Scatter(
+        #         x=df['time_s'], y=series_b, mode='lines', name=f'Block average (per {beats_k} beats)',
+        #         line=dict(width=3)
+        #     ))
         # Optional: show peak markers
         if peaks_idx.size > 0:
             fig.add_trace(go.Scatter(
@@ -1020,6 +885,111 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
+    # === Excel Export ===
+    st.markdown("#### Export data to Excel")
+    if st.button("Export Excel"):
+        with st.spinner("Building Excel file…"):
+            buffer = io.BytesIO()
+            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                # -------- Sheet 1: Filtered(200hz) --------
+                cols_filtered = ['time_s', 'time_mmss_millis', 'comment'] + [c for c in all_signals if c in df.columns]
+                filtered_df = df[cols_filtered].copy()
+                # Ensure Excel-friendly dtypes
+                if 'comment' in filtered_df.columns:
+                    filtered_df['comment'] = filtered_df['comment'].astype(object)
+                filtered_df.to_excel(writer, index=False, sheet_name="Filtered(200hz)")
+
+                # Helper to create a boolean local-highs column from peak indices
+                def _peaks_flag(n, peaks_idx_arr):
+                    arr = np.zeros(n, dtype=int)
+                    if peaks_idx_arr is not None and hasattr(peaks_idx_arr, 'size') and peaks_idx_arr.size > 0:
+                        valid = peaks_idx_arr[(peaks_idx_arr >= 0) & (peaks_idx_arr < n)]
+                        arr[valid] = 1
+                    return arr
+
+                # Access beat-mode aggregates/maps if available
+                agg5_moving_map = st.session_state.get('agg5_moving_map', {})
+                agg5_block_map  = st.session_state.get('agg5_block_map', {})
+                peaks_fp  = st.session_state.get('peaks_idx', np.array([], dtype=int))
+                peaks_cbf = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
+
+                # -------- Sheet 2: MovingMean (all except CBF) --------
+                if isinstance(agg5_moving_map, dict) and len(agg5_moving_map) > 0:
+                    moving_cols = {
+                        'time_s': df['time_s'],
+                        'time_mmss_millis': df['time_mmss_millis'],
+                        'comment': df['comment'],
+                        'local_high_FP': _peaks_flag(len(df), peaks_fp)
+                    }
+                    for sig in all_signals:
+                        if sig == fallback_signal:
+                            continue
+                        series = agg5_moving_map.get(sig, None)
+                        if series is not None:
+                            moving_cols[f'{sig} - MovingMean({beats_k}beats)'] = series
+                    # Ensure Excel-friendly dtypes
+                    if 'comment' in moving_cols:
+                        moving_cols['comment'] = moving_cols['comment'].astype(object)
+                    pd.DataFrame(moving_cols).to_excel(writer, index=False, sheet_name=f"MovingMean(excl CBF)")
+
+
+                # -------- Sheet 3: CBF MovingMean (only CBF) --------
+                if fallback_signal in all_signals and isinstance(agg5_moving_map, dict):
+                    cbf_mov = agg5_moving_map.get(fallback_signal, None)
+                    if cbf_mov is not None:
+                        cbf_m_cols = {
+                            'time_s': df['time_s'],
+                            'time_mmss_millis': df['time_mmss_millis'],
+                            'comment': df['comment'],
+                            'local_high_CBF': _peaks_flag(len(df), peaks_cbf),
+                            f'{fallback_signal} - MovingMean({beats_k}beats)': cbf_mov,
+                        }
+                        # Ensure Excel-friendly dtypes
+                        if 'comment' in cbf_m_cols:
+                            cbf_m_cols['comment'] = cbf_m_cols['comment'].astype(object)
+                        pd.DataFrame(cbf_m_cols).to_excel(writer, index=False, sheet_name="CBF_MovingMean")
+
+   
+                # -------- Sheet: Resampled (time-based) --------
+                if not beat_mode:
+                    # If the radio is time-based, use it; if it's beat-based, reuse the last time-based choice (default 1 min)
+                    label_to_sec = {
+                        "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
+                        "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60,
+                    }
+                    current_choice = st.session_state.get('bin_choice_label', None)
+                    if current_choice in label_to_sec:
+                        selected_label = current_choice
+                    else:
+                        selected_label = st.session_state.get('last_time_bin_label', '1 min')
+                    if selected_label in label_to_sec:
+                        bin_sec = float(label_to_sec[selected_label])
+                        df_tmp = df.copy()
+                        if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any():
+                            t0 = float(df_tmp['time_s'].iloc[0])
+                        else:
+                            t0 = 0.0
+                        df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
+                        resampled = df_tmp.groupby('time_bin').agg(
+                            {**{c: 'mean' for c in all_signals},
+                             'time_s': 'first',
+                             'time_mmss_millis': 'first',
+                             'comment': first_nonempty_comment}
+                        ).reset_index(drop=True)
+                        # Ensure Excel-friendly dtypes
+                        if 'comment' in resampled.columns:
+                            resampled['comment'] = resampled['comment'].astype(object)
+                        sheet_name = f"Resampled({selected_label})"
+                        resampled.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+
+            buffer.seek(0)
+            st.download_button(
+                label="Download Excel",
+                data=buffer.getvalue(),
+                file_name=f"{file_base}_export.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
 
 # Footer
 st.markdown("---")
