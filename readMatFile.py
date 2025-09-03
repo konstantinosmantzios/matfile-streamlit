@@ -951,7 +951,7 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
                         if 'comment' in cbf_m_cols:
                             cbf_m_cols['comment'] = cbf_m_cols['comment'].astype(object)
                         cbf_df_moving = pd.DataFrame(cbf_m_cols)
-                        cbf_df_moving = cbf_df_moving[cbf_df_moving['local_high_FP'] == 1]
+                        cbf_df_moving = cbf_df_moving[cbf_df_moving['local_high_CBF'] == 1]
                         cbf_df_moving.to_excel(writer, index=False, sheet_name=f"MovingMean (CBF)")
 
    
