@@ -931,7 +931,9 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
                     # Ensure Excel-friendly dtypes
                     if 'comment' in moving_cols:
                         moving_cols['comment'] = moving_cols['comment'].astype(object)
-                    pd.DataFrame(moving_cols).to_excel(writer, index=False, sheet_name=f"MovingMean(excl CBF)")
+                    df_moving = pd.DataFrame(moving_cols)
+                    df_moving = df_moving[df_moving['local_high_FP'] == 1]
+                    df_moving.to_excel(writer, index=False, sheet_name=f"MovingMean(Finapress)")
 
 
                 # -------- Sheet 3: CBF MovingMean (only CBF) --------
@@ -948,7 +950,7 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
                         # Ensure Excel-friendly dtypes
                         if 'comment' in cbf_m_cols:
                             cbf_m_cols['comment'] = cbf_m_cols['comment'].astype(object)
-                        pd.DataFrame(cbf_m_cols).to_excel(writer, index=False, sheet_name="CBF_MovingMean")
+                        pd.DataFrame(cbf_m_cols).to_excel(writer, index=False, sheet_name="MovingMean (CBF)")
 
    
                 # -------- Sheet: Resampled (time-based) --------
