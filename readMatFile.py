@@ -934,7 +934,7 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
                     df_moving = pd.DataFrame(moving_cols)
                     df_moving = df_moving[(df_moving['local_high_FP'] == 1) & (df_moving['comment'].notna())]
                     # set all other columns to NaN where comment is not NaN
-                    df_moving.loc[df_moving['comment'].notna(), df_moving.columns.difference(['time_s', 'time_mmss_millis', 'comment'])] = np.nan
+                    # df_moving.loc[df_moving['comment'].notna(), df_moving.columns.difference(['time_s', 'time_mmss_millis', 'comment'])] = np.nan
                     df_moving.to_excel(writer, index=False, sheet_name=f"MovingMean(Finapress)")
 
 
@@ -955,7 +955,7 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
                         cbf_df_moving = pd.DataFrame(cbf_m_cols)
                         cbf_df_moving = cbf_df_moving[(cbf_df_moving['local_high_CBF'] == 1) & (cbf_df_moving['comment'].notna())]
                          # set all other columns to NaN where comment is not NaN
-                        cbf_df_moving.loc[cbf_df_moving['comment'].notna(), cbf_df_moving.columns.difference(['time_s', 'time_mmss_millis', 'comment'])] = np.nan
+                        # cbf_df_moving.loc[cbf_df_moving['comment'].notna(), cbf_df_moving.columns.difference(['time_s', 'time_mmss_millis', 'comment'])] = np.nan
                         cbf_df_moving.to_excel(writer, index=False, sheet_name=f"MovingMean (CBF)")
 
    
