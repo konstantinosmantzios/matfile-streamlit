@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="UTF-8">
+            <title>Standard Operating Procedure &lpar;SOP&rpar;</title>
+            <style>
+/* From extension vscode.github */
+/*---------------------------------------------------------------------------------------------
+ *  Copyright (c) Microsoft Corporation. All rights reserved.
+ *  Licensed under the MIT License. See License.txt in the project root for license information.
+ *--------------------------------------------------------------------------------------------*/
+
+.vscode-dark img[src$=\#gh-light-mode-only],
+.vscode-light img[src$=\#gh-dark-mode-only],
+.vscode-high-contrast:not(.vscode-high-contrast-light) img[src$=\#gh-light-mode-only],
+.vscode-high-contrast-light img[src$=\#gh-dark-mode-only] {
+	display: none;
+}
+
+</style>
+            
+        <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/markdown.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/Microsoft/vscode/extensions/markdown-language-features/media/highlight.css">
+<style>
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe WPC', 'Segoe UI', system-ui, 'Ubuntu', 'Droid Sans', sans-serif;
+                font-size: 14px;
+                line-height: 1.6;
+            }
+        </style>
+        <style>
+.task-list-item {
+    list-style-type: none;
+}
+
+.task-list-item-checkbox {
+    margin-left: -20px;
+    vertical-align: middle;
+    pointer-events: none;
+}
+</style>
+<style>
+:root {
+  --color-note: #0969da;
+  --color-tip: #1a7f37;
+  --color-warning: #9a6700;
+  --color-severe: #bc4c00;
+  --color-caution: #d1242f;
+  --color-important: #8250df;
+}
+
+</style>
+<style>
+@media (prefers-color-scheme: dark) {
+  :root {
+    --color-note: #2f81f7;
+    --color-tip: #3fb950;
+    --color-warning: #d29922;
+    --color-severe: #db6d28;
+    --color-caution: #f85149;
+    --color-important: #a371f7;
+  }
+}
+
+</style>
+<style>
+.markdown-alert {
+  padding: 0.5rem 1rem;
+  margin-bottom: 16px;
+  color: inherit;
+  border-left: .25em solid #888;
+}
+
+.markdown-alert>:first-child {
+  margin-top: 0
+}
+
+.markdown-alert>:last-child {
+  margin-bottom: 0
+}
+
+.markdown-alert .markdown-alert-title {
+  display: flex;
+  font-weight: 500;
+  align-items: center;
+  line-height: 1
+}
+
+.markdown-alert .markdown-alert-title .octicon {
+  margin-right: 0.5rem;
+  display: inline-block;
+  overflow: visible !important;
+  vertical-align: text-bottom;
+  fill: currentColor;
+}
+
+.markdown-alert.markdown-alert-note {
+  border-left-color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-note .markdown-alert-title {
+  color: var(--color-note);
+}
+
+.markdown-alert.markdown-alert-important {
+  border-left-color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-important .markdown-alert-title {
+  color: var(--color-important);
+}
+
+.markdown-alert.markdown-alert-warning {
+  border-left-color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-warning .markdown-alert-title {
+  color: var(--color-warning);
+}
+
+.markdown-alert.markdown-alert-tip {
+  border-left-color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-tip .markdown-alert-title {
+  color: var(--color-tip);
+}
+
+.markdown-alert.markdown-alert-caution {
+  border-left-color: var(--color-caution);
+}
+
+.markdown-alert.markdown-alert-caution .markdown-alert-title {
+  color: var(--color-caution);
+}
+
+</style>
+        
+        </head>
+        <body class="vscode-body vscode-light">
+            <h1 id="standard-operating-procedure-sop">Standard Operating Procedure (SOP)</h1>
+<h3 id="streamlit-mat-file-conversion--filtering-tool">Streamlit MAT File Conversion &amp; Filtering Tool</h3>
+<p> <br>
+ </p>
+<h2 id="-purpose-of-the-tool">📌 Purpose of the Tool</h2>
+<p>This tool converts physiological data stored in MATLAB <code>.mat</code> files into an easy-to-use format (Excel).<br>
+It also allows <strong>filtering</strong> and <strong>resampling</strong> of the signals so they can be cleaned, averaged, and better visualized.</p>
+<p>The tool is designed for <strong>students and researchers with little or no programming background</strong>.<br>
+Everything happens through the <strong>Streamlit web interface</strong>:</p>
+<ul>
+<li>Upload a file</li>
+<li>Adjust a few settings</li>
+<li>Download clean Excel files</li>
+</ul>
+<p> </p>
+<h2 id="️-how-the-tool-works">⚙️ How the Tool Works</h2>
+<ol>
+<li>Upload a <code>.mat</code> file.</li>
+<li>The tool automatically detects key signals:
+<ul>
+<li><strong>Finger Pressure</strong></li>
+<li><strong>Cerebral Blood Flow (CBF)</strong></li>
+<li>and other derived signals</li>
+</ul>
+</li>
+<li>Calibration phases in <strong>Finapress</strong> are automatically removed when possible.</li>
+<li>Choose <strong>filtering methods</strong> for Finger Pressure and/or CBF to remove artifacts.</li>
+<li>Resample the data:
+<ul>
+<li><strong>Time-based</strong> (e.g., every 1 sec, 5 sec, 1 min)</li>
+<li><strong>Beat-based</strong> (e.g., 5 or 10 heartbeats)</li>
+</ul>
+</li>
+<li>Export the results into <strong>Excel</strong> with:
+<ul>
+<li>Timestamps</li>
+<li>Elapsed time</li>
+<li>Comments</li>
+<li>Selected signals</li>
+</ul>
+</li>
+</ol>
+<p> </p>
+<h2 id="-filtering-methods-explained">🔎 Filtering Methods Explained</h2>
+<p>Filtering is <strong>optional</strong>. If unsure, start with defaults.</p>
+<h3 id="1-no-filter">1. No Filter</h3>
+<ul>
+<li>Leaves the signal exactly as recorded.</li>
+<li>Use this if you trust the raw data.</li>
+</ul>
+<hr>
+<h3 id="2-jump-filter">2. Jump Filter</h3>
+<p>Removes sudden, unrealistic jumps in the signal caused by <strong>sensor noise or movement</strong>.</p>
+<p><strong>a. Jump Threshold (size of change)</strong></p>
+<ul>
+<li>
+<p>Defines how big a sudden change must be to count as an artifact.</p>
+</li>
+<li>
+<p>If the signal changes more than this threshold between two points, the point is flagged as invalid.</p>
+</li>
+<li>
+<p>Lower values → <strong>more strict</strong> (even small fluctuations removed).</p>
+</li>
+<li>
+<p>Higher values → <strong>more tolerant</strong> (only very large spikes removed).</p>
+</li>
+</ul>
+<p><strong>b. Close Jump Window (gap between jumps)</strong></p>
+<ul>
+<li>
+<p>Looks at how close together multiple jumps are.</p>
+</li>
+<li>
+<p>If two jumps happen within this many samples, the <strong>entire section between them is deleted</strong>.</p>
+</li>
+<li>
+<p>Lower values → <strong>narrow effect</strong> (only the exact jumps removed).</p>
+</li>
+<li>
+<p>Higher values → <strong>wider effect</strong> (whole section between close jumps removed).</p>
+</li>
+</ul>
+<p><strong>Examples (at 200 Hz sampling):</strong></p>
+<ul>
+<li>100 samples ≈ <strong>0.5 sec</strong> → removes very short noisy bursts.</li>
+<li>500 samples ≈ <strong>2.5 sec</strong> → balanced (default).</li>
+<li>1000 samples ≈ <strong>5 sec</strong> → aggressive, removes long sections if multiple jumps occur close together.</li>
+</ul>
+<hr>
+<h3 id="3-median-filter-advanced-for-cbf">3. Median Filter (Advanced for CBF)</h3>
+<p>Suppresses small <strong>spikes (upward)</strong> or <strong>dips (downward)</strong> in the CBF signal while preserving the overall shape.</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li>
+<p><strong>Median Window Length (smoothing strength)</strong></p>
+<ul>
+<li>Defines how wide the averaging window is for smoothing.</li>
+<li>Lower values → lighter smoothing (<strong>keeps detail but leaves noise</strong>).</li>
+<li>Higher values → stronger smoothing (<strong>removes noise but may blur sharp changes</strong>).</li>
+</ul>
+</li>
+<li>
+<p><strong>Positive Spike Threshold (upward spikes)</strong></p>
+<ul>
+<li>Defines strictness for suppressing sudden <strong>upward spikes</strong>.</li>
+<li>Lower values → stricter (removes even small upward jumps).</li>
+<li>Higher values → more tolerant (keeps detail, but large spikes may remain).</li>
+</ul>
+</li>
+<li>
+<p><strong>Negative Spike Threshold (downward dips)</strong></p>
+<ul>
+<li>Defines strictness for suppressing sudden <strong>downward dips</strong>.</li>
+<li>Lower values → stricter (removes even small dips).</li>
+<li>Higher values → more tolerant (keeps detail, but some dips may remain).</li>
+</ul>
+</li>
+</ul>
+<p> </p>
+<h2 id="-resampling-options">📉 Resampling Options</h2>
+<p>Since raw signals are at <strong>200 Hz</strong> (very high frequency), you can reduce them into manageable summaries:</p>
+<ul>
+<li>
+<p><strong>Time-based</strong>: average signal every fixed interval (e.g., 1 sec, 10 sec, 1 min).<br>
+<em>Useful for long recordings.</em></p>
+</li>
+<li>
+<p><strong>Beat-based</strong>: produces one row for <strong>each detected beat</strong> (separately for Finger Pressure and CBF).</p>
+<ul>
+<li>Each channel keeps its own beat timing (Finapress and CBF beats do not align exactly).</li>
+<li>For every beat, the value shown is the <strong>mean of the previous N detected beats</strong> (e.g., 5 or 10).</li>
+<li>This way, each row represents a real detected beat, with smoothed values that reflect the recent history of that signal.<br>
+<em>Useful for comparing cardiac cycles directly while accounting for natural timing differences.</em></li>
+</ul>
+</li>
+</ul>
+<p>⚠️ <strong>Important</strong>: Comments are preserved at their exact time, even if no other data is present.</p>
+<p> </p>
+<h2 id="-exported-excel-sheets">📂 Exported Excel Sheets</h2>
+<ul>
+<li>
+<p><strong>Filtered(200Hz)</strong></p>
+<ul>
+<li>Original signals at high resolution (200 Hz).</li>
+<li>Includes applied filters and comments.</li>
+</ul>
+</li>
+<li>
+<p><strong>Resampled (Time or Beats)</strong></p>
+<ul>
+<li>Cleaner, downsampled signals for easier analysis.</li>
+<li>Includes timestamps, elapsed time, comments, and all selected signals.</li>
+</ul>
+</li>
+</ul>
+<p> </p>
+<h2 id="-notes-for-non-experts">👩‍💻 Notes for Non-Experts</h2>
+<ul>
+<li>If you are not sure which filter to use, <strong>start with defaults</strong>.</li>
+<li>Use <strong>No Filter</strong> if the raw data seem clean (no obvious outliers or noise).</li>
+<li>Use <strong>Jump Filter</strong> if you see unrealistic jumps or spikes.</li>
+<li>Use <strong>Median Filter</strong> for CBF if there is high-frequency noise or small sharp spikes/dips.
+ <br>
+ <br>
+ <br>
+ 
+ <br>
+ </li>
+</ul>
+
+            
+            
+        </body>
+        </html>

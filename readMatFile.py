@@ -1,11 +1,13 @@
 # streamlit run readMatFile.py  
+# streamlit run "Git ReadMatFile/readMatFile.py"  
+
 import numpy as np
 import pandas as pd
 import scipy.io
 import streamlit as st
 import plotly.graph_objects as go
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 import base64
 import io
 
@@ -117,137 +119,210 @@ def find_autocal_column(df: pd.DataFrame) -> str | None:
     return best if best_score > 0 else None
 
 
+
+def matlab_datenum_to_datetime(matlab_datenum):
+    """Convert MATLAB datenum into Python datetime."""
+    days = float(matlab_datenum)
+    python_datetime = datetime.fromordinal(int(days)) \
+        + timedelta(days=days % 1) \
+        - timedelta(days=366)
+    return python_datetime
+
+def normalize_channel_blocks(arr, n_channels):
+    """
+    Normalize datastart/dataend/samplerate arrays so they are always
+    shaped (n_channels, n_blocks).
+    Handles both multi-block and single-block cases.
+    """
+    arr = np.array(arr)
+
+    # Case 1: already (n_channels, n_blocks)
+    if arr.shape[0] == n_channels:
+        return arr
+
+    # Case 2: single row, many columns -> reshape as (n_channels, 1)
+    if arr.shape[0] == 1 and arr.shape[1] >= n_channels:
+        return arr.reshape(n_channels, 1)
+
+    # Case 3: single column, many rows -> fine
+    if arr.shape[1] == 1 and arr.shape[0] == n_channels:
+        return arr
+
+    # Case 4: transposed (n_blocks, n_channels)
+    if arr.shape[1] == n_channels:
+        return arr.T
+
+    # Fallback: broadcast to n_channels
+    return np.tile(arr, (n_channels, 1))
+
+
+def channel_info_df(mat):
+    titles = [t.strip() for t in mat["titles"]]
+    n_channels = len(titles)
+
+    datastart = normalize_channel_blocks(mat["datastart"], n_channels)
+    dataend   = normalize_channel_blocks(mat["dataend"], n_channels)
+    samplerate = normalize_channel_blocks(mat["samplerate"], n_channels)
+
+    unittext = [u.strip() for u in mat["unittext"]]
+    unitmap = np.atleast_2d(mat["unittextmap"])
+
+    rows = []
+    for i, title in enumerate(titles):
+        # Unit handling
+        unit_index = int(unitmap[i, 0]) - 1 if i < unitmap.shape[0] else None
+        unit = unittext[unit_index] if unit_index is not None and 0 <= unit_index < len(unittext) else None
+
+        # Samplerate: pick first nonzero value from row
+        sr_row = samplerate[i].ravel() if i < samplerate.shape[0] else []
+        sr_vals = [v for v in sr_row if v > 0]
+        sr = float(sr_vals[0]) if sr_vals else None
+
+        # Force datastart/dataend into lists, even for single values
+        ds = np.atleast_1d(datastart[i]).tolist()
+        de = np.atleast_1d(dataend[i]).tolist()
+
+        rows.append({
+            "channel_index": i + 1,
+            "title": title,
+            "datastart": ds,
+            "dataend": de,
+            "samplerate": sr,
+            "unit": unit
+        })
+
+    return pd.DataFrame(rows)
+
+def comments_df(mat, df_channels):
+    blocktimes = np.atleast_1d(mat['blocktimes'])
+    com = np.atleast_2d(mat['com'])
+    comtext = mat['comtext']
+
+    block_start_times = [matlab_datenum_to_datetime(bt) for bt in blocktimes]
+
+    # Use the first nonzero samplerate as reference
+    base_samplerate = df_channels["samplerate"].replace(0, np.nan).dropna().iloc[0]
+
+    rows = []
+    for row in com:
+        block_index = int(row[1])  # 1-based block index
+        if block_index < 1 or block_index > len(block_start_times):
+            continue  # invalid index for single-block case
+
+        sample_index = float(row[2])  # sample index
+        comment_text_index = int(row[4])  # 1-based index into comtext
+
+        block_start_time = block_start_times[block_index - 1]
+
+        # Convert samples → seconds
+        comment_time_s = sample_index / base_samplerate
+        absolute_time = block_start_time + timedelta(seconds=comment_time_s)
+
+        comment_text = (
+            str(comtext[comment_text_index - 1]).strip()
+            if 1 <= comment_text_index <= len(comtext)
+            else "(invalid index)"
+        )
+
+        rows.append({
+            "block_index": block_index,
+            "block_start_time": block_start_time,
+            "sample_index": int(sample_index),
+            "comment_time_s": comment_time_s,
+            "absolute_time": absolute_time,
+            "comment_text": comment_text
+        })
+
+    return pd.DataFrame(rows)
+
+
+def sec_to_mmss_millis(seconds: float) -> str:
+    minutes = int(seconds // 60)
+    secs = int(seconds % 60)
+    millis = int(round((seconds - int(seconds)) * 1000))
+    return f"{minutes:02d}:{secs:02d}.{millis:03d}"
+
+
 @st.cache_data
-def load_mat_file(mat_file) -> pd.DataFrame:
-    mat = scipy.io.loadmat(mat_file, squeeze_me=True)
-    data_flat = mat['data'].flatten()
+def extract_channel_signals_with_comments(mat, df_comments):
+    titles = [t.strip() for t in mat["titles"]]
+    n_channels = len(titles)
 
-    datastart = np.atleast_2d(mat['datastart'])
-    dataend = np.atleast_2d(mat['dataend'])
-    if datastart.shape[0] == 1 and datastart.shape[1] > 1:
-        datastart = datastart.T
-        dataend = dataend.T
+    # Get channel info (already normalized)
+    df_channels = channel_info_df(mat)
 
-    titles = [t.strip() for t in mat['titles']]
-    samplerate = mat['samplerate']
-    com = mat.get('com', np.array([]))
-    comtext = mat.get('comtext', [])
+    data_flat = mat["data"].flatten()
+    blocktimes = np.atleast_1d(mat["blocktimes"])
 
-    def extract_channel(idx):
-        """Return (signal_full, fs) or (None, None) if missing."""
-        sig_parts = []
-        for block in range(datastart.shape[1]):
-            s = datastart[idx, block]
-            e = dataend[idx, block]
-            if not np.isnan(s) and not np.isnan(e):
-                start = int(s) - 1
-                end = int(e)
-                if 0 <= start < end <= data_flat.size:
-                    sig_parts.append(data_flat[start:end])
-        if not sig_parts:
-            return None, None
-        sig = np.concatenate(sig_parts)
+    # Filter valid channels
+    EXCLUDE = {"Channel 24", "Channel 25", "Channel 26"}
+    valid_channels = df_channels[
+        (df_channels["samplerate"] > 0) & (~df_channels["title"].isin(EXCLUDE))
+    ]
 
-        try:
-            fs = int(samplerate[idx, 0]) if samplerate.ndim > 1 else int(samplerate[idx])
-        except Exception:
-            fs = None
-        if fs is None or fs <= 0 or not np.isfinite(fs):
-            fs = None
-        return sig, fs
-
-    # Prefer CBF (index 17) for the time base; else Channel 1 (index 0)
-    ch18_idx = 17 if len(titles) > 17 else None
-    sig18, fs18 = (extract_channel(ch18_idx) if ch18_idx is not None else (None, None))
-    sig1,  fs1  = extract_channel(0)
-
-    if sig18 is not None and fs18:
-        base_sig = sig18
-        base_fs = fs18
-    elif sig1 is not None and fs1:
-        base_sig = sig1
-        base_fs = fs1
-    else:
-        st.warning("No valid samplerate/time base found in CBF or Channel 1.")
+    if valid_channels.empty:
         return pd.DataFrame()
 
-    # Build time from the chosen base
-    min_length = len(base_sig)
-    time = (np.arange(min_length) / float(base_fs)) if min_length > 0 else np.array([])
+    sr_ref = valid_channels.iloc[0]["samplerate"]
+    n_blocks = len(valid_channels.iloc[0]["datastart"])
 
-    time_mmss_millis = [sec_to_mmss_millis(t) for t in time] if len(time) > 0 else []
+    # Build signals
+    signals = {}
+    block_lengths = [0] * n_blocks
 
-    # Collect all signals, truncated to the base length
-    signals, channel_names = [], []
-    for i in range(len(titles)):
-        ch_parts = []
-        for block in range(datastart.shape[1]):
-            s = datastart[i, block]
-            e = dataend[i, block]
-            if not np.isnan(s) and not np.isnan(e):
-                start = int(s) - 1
-                end = int(e)
-                if 0 <= start < end <= data_flat.size:
-                    ch_parts.append(data_flat[start:end])
-        if ch_parts:
-            sig = np.concatenate(ch_parts)
-            if sig.size > 0 and np.isfinite(sig).any():
-                signals.append(sig[:min_length])
-                channel_names.append(titles[i])
+    for _, row in valid_channels.iterrows():
+        tname = row["title"]
+        sig_parts = []
+        for b, (s, e) in enumerate(zip(row["datastart"], row["dataend"])):
+            if s >= 1 and e > s and e <= len(data_flat):
+                part = data_flat[int(s) - 1:int(e)]
+                sig_parts.append(part)
+                if block_lengths[b] == 0:
+                    block_lengths[b] = len(part)
+        if sig_parts:
+            signals[tname] = np.concatenate(sig_parts)
 
     if not signals:
-        st.warning("No valid signal data in this MAT file after alignment.")
         return pd.DataFrame()
 
-    # Main DataFrame
-    data = {"time_s": time, "time_mmss_millis": time_mmss_millis}
-    for ch_name, ch_data in zip(channel_names, signals):
-        data[ch_name] = ch_data
-    df = pd.DataFrame(data)
-    # --- Enforce stable dtypes to avoid pandas casting warnings ---
-    # Numeric time in float64
-    df['time_s'] = pd.to_numeric(df['time_s'], errors='coerce').astype('float64')
-    # All channel columns coerced to float64
-    for ch_name in channel_names:
-        df[ch_name] = pd.to_numeric(df[ch_name], errors='coerce').astype('float64')
-    # Ensure time_mmss_millis is a stable string dtype
-    df['time_mmss_millis'] = pd.Series(time_mmss_millis, dtype='string')
+    total_len = sum(block_lengths)
+    block_offsets = np.cumsum([0] + block_lengths[:-1])
 
-    # Events: prefer fs from Channel 1 if valid; else use base_fs
-    fs_events = fs1 if (fs1 and fs1 > 0) else base_fs
-    event_times, event_labels = [], []
-    if com is not None and np.size(com) > 0 and fs_events:
-        for row in np.atleast_2d(com):
-            try:
-                timestamp_samples = float(row[2])
-                t_sec = timestamp_samples / float(fs_events)
-                try:
-                    text_idx = int(row[4]) - 1
-                    text = comtext[text_idx].strip() if 0 <= text_idx < len(comtext) else f"(invalid text index: {row[4]})"
-                except Exception:
-                    text = "(no text)"
-                event_times.append(t_sec)
-                event_labels.append(text)
-            except Exception:
-                continue
+    df = pd.DataFrame({name: sig[:total_len] for name, sig in signals.items()})
 
-    # Attach event comments at closest timestamps
-    comments_col = np.full(min_length, "", dtype=object)
-    for t_event, label in zip(event_times, event_labels):
-        if len(time) == 0:
-            break
-        idx = int(np.nanargmin(np.abs(time - t_event)))
-        comments_col[idx] = label
-    df["comment"] = pd.Series(comments_col, dtype='string')
+    # Add time_s
+    time_s = np.arange(total_len, dtype=float) / sr_ref
+    df.insert(0, "time_s", time_s)
 
-    # Drop unwanted channels
-    columnsDrop = [
-        '7: Interbeat Interval', '8: Active Cuff', '9: Cuff Countdown',
-        '10: AutoCal Quality', '16: PL ch 1 lead 1', '17: PL ch 2 lead 2',
-        '19: Lead aVR', '20: Lead aVL', '21: Lead aVF', '22: HR EKG lead 1',
-        '23: : HR EKG lead 2', 'Channel 24', 'Channel 25', 'Channel 26',
-    ]
-    df = df.drop(columns=[c for c in columnsDrop if c in df.columns], errors='ignore')
+    # Add absolute_time
+    block_start_times = [matlab_datenum_to_datetime(bt) for bt in blocktimes]
+    abs_time = np.empty(total_len, dtype="datetime64[ns]")
+    write_pos = 0
+    for b, Lb in enumerate(block_lengths):
+        if Lb <= 0:
+            continue
+        base = block_start_times[min(b, len(block_start_times) - 1)]
+        seg_times = [base + timedelta(seconds=k / sr_ref) for k in range(Lb)]
+        abs_time[write_pos:write_pos + Lb] = np.array(seg_times, dtype="datetime64[ns]")
+        write_pos += Lb
+    df.insert(1, "absolute_time", abs_time)
+
+    # Add time_mmss_millis
+    df.insert(2, "time_mmss_millis", [sec_to_mmss_millis(t) for t in time_s])
+
+    # Add comments
+    df["comment"] = ""
+    if df_comments is not None and not df_comments.empty:
+        for _, ev in df_comments.iterrows():
+            b = int(ev["block_index"]) - 1
+            s_idx = int(ev["sample_index"])
+            if 0 <= b < n_blocks and 0 <= s_idx < block_lengths[b]:
+                idx_global = block_offsets[b] + s_idx
+                if idx_global < len(df):
+                    if df.at[idx_global, "comment"]:
+                        df.at[idx_global, "comment"] += " | " + str(ev["comment_text"])
+                    else:
+                        df.at[idx_global, "comment"] = str(ev["comment_text"])
 
     return df
 
@@ -303,7 +378,14 @@ if uploaded_mat:
     file_name = uploaded_mat.name
     file_base = os.path.splitext(file_name)[0]
 
-    df = load_mat_file(uploaded_mat)
+    mat = scipy.io.loadmat(uploaded_mat, squeeze_me=True)
+
+    df_channel_info = channel_info_df(mat)
+    df_comments = comments_df(mat, df_channel_info)
+    # print(df_channel_info)
+    # print(df_comments)
+    
+    df = extract_channel_signals_with_comments(mat, df_comments)
     all_columns = list(df.columns)
     # Determine available signals and set mode based on actual content
     priority_signal = '1: Finger Pressure'
@@ -321,7 +403,7 @@ if uploaded_mat:
         return valid_count > 0 and valid_count / len(vals) >= min_ratio
 
     if is_valid_signal(df, priority_signal):
-        all_signals = [c for c in df.columns if c not in ['time_s', 'time_mmss_millis', 'comment']]
+        all_signals = [c for c in df.columns if c not in ['time_s', 'absolute_time', 'time_mmss_millis', 'comment']]
         main_signal = priority_signal
     elif is_valid_signal(df, fallback_signal):
         all_signals = [fallback_signal]
@@ -349,39 +431,118 @@ if uploaded_mat:
 
     # Only show the filtering controls if '1: Finger Pressure' is present
     if main_signal == priority_signal:
-        with st.expander("Finger Pressure Filtering Settings", expanded=False):  # <-- collapsed by default
-            filter_method_fp = st.radio(
-                "Filter Method",
-                ["No Filter", "Jump Filter"],
-                index=1,  # default to Jump Filter
-                horizontal=True,
-                key="fp_filter_method"
+        with st.expander("Finger Pressure – Filtering Options", expanded=False):
+            st.markdown(
+                "These settings help remove noise and sudden jumps from the Finger Pressure signal. "
+                "If you're unsure, leave the defaults. "
+                "Use the tooltips for guidance."
             )
+
+            filter_method_fp = st.radio(
+                "Choose filtering method",
+                ["No Filter", "Jump Filter"],
+                index=1,
+                horizontal=True,
+                key="fp_filter_method",
+                help="No Filter = raw signal. Jump Filter = removes sudden unrealistic jumps."
+            )
+
             if filter_method_fp == "Jump Filter":
-                jumpval_fp = st.slider("Jump Threshold (Δ)", 5, 100, 30, step=5, key="fp_jumpval")
-                indxval_fp = st.slider("Close Jump Window (samples)", 10, 1000, 500, step=10, key="fp_indxval")
-            # (No controls needed for "No Filter")
+                jumpval_fp = st.slider(
+                    "Jump Threshold (Δ amplitude)",
+                    5, 100, 30, step=5, key="fp_jumpval",
+                    help=(
+                        "Defines how big a sudden change must be to be treated as an artifact.\n\n"
+                        "- **Lower values** → More aggressive: even small fluctuations may be removed.\n"
+                        "- **Higher values** → More tolerant: only very large jumps are removed.\n\n"
+                        "Default: 30 (balanced)."
+                    )
+                )
+                indxval_fp = st.slider(
+                    "Close Jump Window (samples)",
+                    10, 1000, 500, step=10, key="fp_indxval",
+                    help=(
+                        "Defines how many samples around a detected jump are also marked invalid.\n\n"
+                        "- **Lower values** → Narrow masking (keeps more data, but may leave residual noise).\n"
+                        "- **Higher values** → Wider masking (removes more data, but ensures cleaner signal).\n\n"
+                        "Default: 500."
+                    )
+                )
 
     if uploaded_mat and fallback_signal in all_columns:
-        with st.expander("### CBF Filtering Settings", expanded=False):  # <-- collapsed by default
-            filter_method_ch18 = st.radio(
-                "Filter Method",
-                ["No Filter", "Jump Filter"],
-                index=1,  # default to Jump Filter
-                horizontal=True,
-                key="ch18_filter_method"
+        with st.expander("Cerebral Blood Flow (CBF) – Filtering Options", expanded=False):
+            st.markdown(
+                "These settings help remove noise, sudden jumps, and spikes from the CBF signal. "
+                "Start with the defaults unless you know the data well. "
+                "Use the tooltips for explanation."
             )
+
+            filter_method_ch18 = st.radio(
+                "Choose filtering method",
+                ["No Filter", "Jump Filter"],
+                index=1,
+                horizontal=True,
+                key="ch18_filter_method",
+                help="No Filter = raw signal. Jump Filter = removes sudden unrealistic jumps."
+            )
+
             if filter_method_ch18 == "Jump Filter":
-                jumpval_ch18 = st.slider("Jump Threshold (Δ)", 5, 100, 10, step=5, key="ch18_jumpval")
-                indxval_ch18 = st.slider("Close Jump Window (samples)", 10, 1000, 200, step=10, key="ch18_indxval")
-                _med_win_ch18 = st.slider("Window length (samples)", 0, 1000, 200, step=10, key="_med_win_ch18") # window length (samples)
-                _k_pos_ch18 = st.slider("Threshold for positive", 0.0, 15.0, 5.0, step=0.1, key="_k_pos_ch18") # threshold for positive spikes (in MADs)
-                _k_neg_ch18 = st.slider("Threshold for negative", 0.0, 15.0, 1.5, step=0.1, key="_k_neg_ch18") # threshold for negative spikes (more tolerant below)
+                st.subheader("Basic Settings")
+                jumpval_ch18 = st.slider(
+                    "Jump Threshold (Δ amplitude)",
+                    5, 100, 10, step=5, key="ch18_jumpval",
+                    help=(
+                        "Defines how big a sudden change must be to be treated as an artifact.\n\n"
+                        "- **Lower values** → More aggressive: catches small jumps, may remove real variations.\n"
+                        "- **Higher values** → More tolerant: ignores small jumps, only removes extreme ones.\n\n"
+                        "Default: 10."
+                    )
+                )
+                indxval_ch18 = st.slider(
+                    "Close Jump Window (samples)",
+                    10, 1000, 200, step=10, key="ch18_indxval",
+                    help=(
+                        "Defines how many samples around a detected jump are also removed.\n\n"
+                        "- **Lower values** → Minimal effect area (preserves more data, may keep small noise).\n"
+                        "- **Higher values** → Larger effect area (removes more data, ensures cleaner signal).\n\n"
+                        "Default: 200."
+                    )
+                )
 
-
-            # (No controls shown for "No Filter")
-    # (No fallback ch18_order block needed; unused.)
-
+                st.subheader("Advanced Outlier Control")
+                _med_win_ch18 = st.slider(
+                    "Median Window Length (samples)",
+                    0, 1000, 200, step=10, key="_med_win_ch18",
+                    help=(
+                        "Defines the window size for smoothing the signal using a rolling median.\n\n"
+                        "- **Smaller values** → Less smoothing, keeps fine detail (but may leave noise).\n"
+                        "- **Larger values** → Stronger smoothing, removes noise (but may blur fast changes).\n\n"
+                        "Default: 200."
+                    )
+                )
+                _k_pos_ch18 = st.slider(
+                    "Positive Spike Threshold (MADs)",
+                    0.0, 15.0, 5.0, step=0.1, key="_k_pos_ch18",
+                    help=(
+                        "Controls removal of sudden upward spikes.\n"
+                        "Measured in Median Absolute Deviations (MADs).\n\n"
+                        "- **Lower values** → Stricter removal: even small spikes are clipped.\n"
+                        "- **Higher values** → More tolerant: only very large spikes are clipped.\n\n"
+                        "Default: 5.0."
+                    )
+                )
+                _k_neg_ch18 = st.slider(
+                    "Negative Spike Threshold (MADs)",
+                    0.0, 15.0, 1.5, step=0.1, key="_k_neg_ch18",
+                    help=(
+                        "Controls removal of sudden downward dips.\n"
+                        "Measured in Median Absolute Deviations (MADs).\n\n"
+                        "- **Lower values** → Stricter: clips even small dips.\n"
+                        "- **Higher values** → More tolerant: only very large dips are clipped.\n\n"
+                        "Default: 1.5."
+                    )
+                )
+            
     if st.button("Convert and Resample"):
         with st.spinner("Converting and resampling... Please wait."):
             if main_signal == priority_signal:
@@ -444,17 +605,32 @@ if uploaded_mat:
                 t0 = df_sorted['time_s'].iloc[0]
 
                 if not beat_mode:
-                    df_sorted['time_bin'] = ((df_sorted['time_s'] - t0) // bin_seconds).astype(int)
-                    agg = df_sorted.groupby('time_bin').agg(
+                    label_to_sec = {
+                        "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
+                        "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60,
+                    }
+                    current_choice = st.session_state.get('bin_choice_label', None)
+                    selected_label = current_choice if current_choice in label_to_sec else st.session_state.get('last_time_bin_label', '1 min')
+                    bin_sec = float(label_to_sec.get(selected_label, 60))
+
+                    df_tmp = df_sorted.copy()
+                    if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any():
+                        t0 = float(df_tmp['time_s'].iloc[0])
+                    else:
+                        t0 = 0.0
+
+                    df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
+
+                    result_df = df_tmp.groupby('time_bin').agg(
                         {**{c: 'mean' for c in all_signals},
+                         'absolute_time': 'first',
                          'time_s': 'first',
                          'time_mmss_millis': 'first',
                          'comment': first_nonempty_comment}
-                    ).reset_index()
-                    agg['bin_start_time'] = t0 + agg['time_bin'] * bin_seconds
+                    ).reset_index(drop=True)
 
                     st.session_state.df = df
-                    st.session_state.result_df = agg
+                    st.session_state.result_df = result_df
                     st.session_state.all_signals = all_signals
                     st.session_state.beat_mode = False
                 else:
@@ -655,17 +831,32 @@ if uploaded_mat:
                 t0 = df_sorted['time_s'].iloc[0]
 
                 if not beat_mode:
-                    df_sorted['time_bin'] = ((df_sorted['time_s'] - t0) // bin_seconds).astype(int)
-                    agg = df_sorted.groupby('time_bin').agg(
-                        {main_signal: 'mean', 'time_s': 'first',
-                          'time_mmss_millis': 'first',
-                            'comment': first_nonempty_comment 
-                          }
-                    ).reset_index()
-                    agg['bin_start_time'] = t0 + agg['time_bin'] * bin_seconds
+                    label_to_sec = {
+                        "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
+                        "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60,
+                    }
+                    current_choice = st.session_state.get('bin_choice_label', None)
+                    selected_label = current_choice if current_choice in label_to_sec else st.session_state.get('last_time_bin_label', '1 min')
+                    bin_sec = float(label_to_sec.get(selected_label, 60))
+
+                    df_tmp = df_sorted.copy()
+                    if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any():
+                        t0 = float(df_tmp['time_s'].iloc[0])
+                    else:
+                        t0 = 0.0
+
+                    df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
+
+                    result_df = df_tmp.groupby('time_bin').agg(
+                        {**{main_signal: 'mean'},
+                         'absolute_time': 'first',
+                         'time_s': 'first',
+                         'time_mmss_millis': 'first',
+                         'comment': first_nonempty_comment}
+                    ).reset_index(drop=True)
 
                     st.session_state.df = df
-                    st.session_state.result_df = agg
+                    st.session_state.result_df = result_df
                     st.session_state.all_signals = [main_signal]
                     st.session_state.beat_mode = False
                 else:
@@ -785,20 +976,27 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
 
     if plot_signal == fallback_signal:
         fig.add_trace(go.Scatter(
-            x=df['time_s'], y=df['unfiltered_signal_Ch_18'], mode='lines', name='Unfiltered CBF',
+            x=df['time_s'], y=df['unfiltered_signal_Ch_18'], mode='lines', name='Raw (unfiltered)',
             line=dict(color='rgba(200,200,200,0.5)', width=1)
         ))
 
     elif plot_signal in ['1: Finger Pressure',	'2: MAP', '3: Systolic',	'4: Diastolic']:
+        if plot_signal == '1: Finger Pressure':
+            raw_name = "Raw (unfiltered)"
+        else:
+            raw_name = "Raw (Finger Pressure)"
         fig.add_trace(go.Scatter(
-            x=df['time_s'], y=df['unfiltered_signal'], mode='lines', name='Unfiltered',
+            x=df['time_s'], y=df['unfiltered_signal'], mode='lines', name=raw_name,
             line=dict(color='rgba(200,200,200,0.5)', width=1)
         ))
 
     fig.add_trace(go.Scatter(
         x=df['time_s'], y=df[plot_signal], mode='lines', name='Filtered',
-        line=dict(color='cyan', width=2)
-    ))
+        line=dict(color='cyan', width=1,),
+        hovertemplate="Time: %{customdata}<br>Value: %{y}<extra></extra>",
+        customdata=df['time_s'].apply(sec_to_mmss_millis)
+    ))    
+    
     if not beat_mode and result_df is not None:
         fig.add_trace(go.Scatter(
             x=result_df['time_s'], y=result_df[plot_signal], mode='lines', name='Aggregated',
@@ -817,19 +1015,20 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
         if series_m is not None and np.isfinite(series_m).any():
             fig.add_trace(go.Scatter(
                 x=df['time_s'], y=series_m, mode='lines', name=f'Moving mean ({beats_k} peaks)',
-                line=dict(width=3)
+                line=dict(color='orange', width=3)
             ))
         # if series_b is not None and np.isfinite(series_b).any():
         #     fig.add_trace(go.Scatter(
         #         x=df['time_s'], y=series_b, mode='lines', name=f'Block average (per {beats_k} beats)',
         #         line=dict(width=3)
         #     ))
-        # Optional: show peak markers
-        if peaks_idx.size > 0:
+        if peaks_idx.size > 0 and plot_signal in ['1: Finger Pressure', '6: CBF']:
             fig.add_trace(go.Scatter(
-                x=df['time_s'].iloc[peaks_idx], y=df[plot_signal].iloc[peaks_idx],
-                mode='markers', name='Local Highs (HR-dynamic)',
-                marker=dict(size=7, symbol='diamond')
+                x=df['time_s'].iloc[peaks_idx],
+                y=df[plot_signal].iloc[peaks_idx],
+                mode='markers',
+                name='Local Highs',
+                marker=dict(size=6, color='orange', symbol='circle-open')
             ))
 
     comment_locs = df[df['comment'].notna() & (df['comment'] != '')]
@@ -893,115 +1092,178 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
                 # -------- Sheet 1: Filtered(200hz) --------
-                cols_filtered = ['time_s', 'time_mmss_millis', 'comment'] + [c for c in all_signals if c in df.columns]
+                cols_filtered = ['absolute_time', 'time_s', 'time_mmss_millis', 'comment'] + [
+                    c for c in all_signals if c in df.columns
+                ]
                 filtered_df = df[cols_filtered].copy()
-                # Ensure Excel-friendly dtypes
                 if 'comment' in filtered_df.columns:
                     filtered_df['comment'] = filtered_df['comment'].astype(object)
                 filtered_df.to_excel(writer, index=False, sheet_name="Filtered(200hz)")
 
-                # Helper to create a boolean local-highs column from peak indices
-                def _peaks_flag(n, peaks_idx_arr):
-                    arr = np.zeros(n, dtype=int)
-                    if peaks_idx_arr is not None and hasattr(peaks_idx_arr, 'size') and peaks_idx_arr.size > 0:
-                        valid = peaks_idx_arr[(peaks_idx_arr >= 0) & (peaks_idx_arr < n)]
-                        arr[valid] = 1
-                    return arr
+                # -------- Sheet 2: Resampled --------
+                if beat_mode:
+                    # Beat-based mode (use agg5_moving_map)
+                    agg5_moving_map = st.session_state.get('agg5_moving_map', {})
+                    peaks_fp = st.session_state.get('peaks_idx', np.array([], dtype=int))
+                    peaks_cbf = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
 
-                # Access beat-mode aggregates/maps if available
-                agg5_moving_map = st.session_state.get('agg5_moving_map', {})
-                agg5_block_map  = st.session_state.get('agg5_block_map', {})
-                peaks_fp  = st.session_state.get('peaks_idx', np.array([], dtype=int))
-                peaks_cbf = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
+                    if isinstance(agg5_moving_map, dict) and len(agg5_moving_map) > 0:
+                        abs_time = pd.to_datetime(df['absolute_time'])
+                        time_diff = abs_time.diff().dt.total_seconds().fillna(0)
+                        time_s_fixed = time_diff.cumsum()
+                        time_mmss_millis_fixed = time_s_fixed.apply(sec_to_mmss_millis)
 
-                # -------- Sheet 2: MovingMean (all except CBF) --------
-                if isinstance(agg5_moving_map, dict) and len(agg5_moving_map) > 0:
-                    moving_cols = {
-                        'time_s': df['time_s'],
-                        'time_mmss_millis': df['time_mmss_millis'],
-                        'comment': df['comment'],
-                        'local_high_FP': _peaks_flag(len(df), peaks_fp)
-                    }
-                    for sig in all_signals:
-                        if sig == fallback_signal:
-                            continue
-                        series = agg5_moving_map.get(sig, None)
-                        if series is not None:
-                            moving_cols[f'{sig} - MovingMean({beats_k}beats)'] = series
-                    # Ensure Excel-friendly dtypes
-                    if 'comment' in moving_cols:
-                        moving_cols['comment'] = moving_cols['comment'].astype(object)
-                    df_moving = pd.DataFrame(moving_cols)
-                    df_moving['comment'] = df_moving['comment'].replace(r'^\s*$', np.nan, regex=True)
-                    df_moving = df_moving[(df_moving['local_high_FP'] == 1) | (df_moving['comment'].notna())]
-                    # set all other columns to NaN where comment is not NaN
-                    df_moving.loc[df_moving['comment'].notna(), df_moving.columns.difference(['time_s', 'time_mmss_millis', 'comment'])] = np.nan
-                    df_moving.to_excel(writer, index=False, sheet_name=f"MovingMean(Finapress)")
+                        def _peaks_flag(n, peaks_idx_arr):
+                            arr = np.zeros(n, dtype=int)
+                            if peaks_idx_arr is not None and hasattr(peaks_idx_arr, 'size') and peaks_idx_arr.size > 0:
+                                valid = peaks_idx_arr[(peaks_idx_arr >= 0) & (peaks_idx_arr < n)]
+                                arr[valid] = 1
+                            return arr
 
-
-                # -------- Sheet 3: CBF MovingMean (only CBF) --------
-                if fallback_signal in all_signals and isinstance(agg5_moving_map, dict):
-                    cbf_mov = agg5_moving_map.get(fallback_signal, None)
-                    if cbf_mov is not None:
-                        cbf_m_cols = {
-                            'time_s': df['time_s'],
-                            'time_mmss_millis': df['time_mmss_millis'],
-                            'comment': df['comment'],
+                        merged_cols = {
+                            'Datetime': df['absolute_time'],
+                            'Elapsed Time (s)': time_s_fixed,
+                            'Elapsed Time (mm:ss.ms)': time_mmss_millis_fixed,
+                            'Comment': df['comment'],
+                            'local_high_FP': _peaks_flag(len(df), peaks_fp),
                             'local_high_CBF': _peaks_flag(len(df), peaks_cbf),
-                            f'{fallback_signal} - MovingMean({beats_k}beats)': cbf_mov,
                         }
-                        # Ensure Excel-friendly dtypes
-                        if 'comment' in cbf_m_cols:
-                            cbf_m_cols['comment'] = cbf_m_cols['comment'].astype(object)
-                        cbf_df_moving = pd.DataFrame(cbf_m_cols)
-                        cbf_df_moving['comment'] = cbf_df_moving['comment'].replace(r'^\s*$', np.nan, regex=True)
-                        cbf_df_moving = cbf_df_moving[(cbf_df_moving['local_high_CBF'] == 1) | (cbf_df_moving['comment'].notna())]
-                         # set all other columns to NaN where comment is not NaN
-                        cbf_df_moving.loc[cbf_df_moving['comment'].notna(), cbf_df_moving.columns.difference(['time_s', 'time_mmss_millis', 'comment'])] = np.nan
-                        cbf_df_moving.to_excel(writer, index=False, sheet_name=f"MovingMean (CBF)")
 
-   
-                # -------- Sheet: Resampled (time-based) --------
-                if not beat_mode:
-                    # If the radio is time-based, use it; if it's beat-based, reuse the last time-based choice (default 1 min)
+                        for sig in all_signals:
+                            series = agg5_moving_map.get(sig, None)
+                            if series is not None:
+                                merged_cols[f'{sig} - MovingMean({beats_k}beats)'] = series
+
+                        df_resampled = pd.DataFrame(merged_cols)
+                        df_resampled['comment'] = df_resampled['comment'].replace(r'^\s*$', np.nan, regex=True)
+
+                        # Mask signals based on local_high flags
+                        for col in df_resampled.columns:
+                            if col.endswith(f'MovingMean({beats_k}beats)'):
+                                if col.startswith("6: CBF"):
+                                    df_resampled.loc[df_resampled['local_high_CBF'] == 0, col] = np.nan
+                                else:
+                                    df_resampled.loc[df_resampled['local_high_FP'] == 0, col] = np.nan
+
+                        # Keep only rows with peaks or comments
+                        df_resampled = df_resampled[
+                            (df_resampled['local_high_FP'] == 1) |
+                            (df_resampled['local_high_CBF'] == 1) |
+                            (df_resampled['comment'].notna())
+                        ]
+                        df_resampled = df_resampled.drop(columns=['local_high_FP', 'local_high_CBF'])
+                        df_resampled.loc[df_resampled['comment'].notna(),
+                                        df_resampled.columns.difference(
+                                            ['absolute_time', 'time_s', 'time_mmss_millis', 'comment']
+                                        )] = np.nan
+
+                        sheet_name = f"Resampled({beats_k}beats)"
+                        df_resampled.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+
+                else:
                     label_to_sec = {
                         "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
                         "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60,
                     }
                     current_choice = st.session_state.get('bin_choice_label', None)
-                    if current_choice in label_to_sec:
-                        selected_label = current_choice
-                    else:
-                        selected_label = st.session_state.get('last_time_bin_label', '1 min')
+                    selected_label = (
+                        current_choice if current_choice in label_to_sec
+                        else st.session_state.get('last_time_bin_label', '1 min')
+                    )
+
                     if selected_label in label_to_sec:
                         bin_sec = float(label_to_sec[selected_label])
+
                         df_tmp = df.copy()
-                        if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any():
-                            t0 = float(df_tmp['time_s'].iloc[0])
-                        else:
-                            t0 = 0.0
+                        t0 = float(df_tmp['time_s'].iloc[0]) if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any() else 0.0
+
+                        # Assign time bins
                         df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
+
+                        # Aggregate by bin (exclude comments here to avoid duplication)
                         resampled = df_tmp.groupby('time_bin').agg(
                             {**{c: 'mean' for c in all_signals},
-                             'time_s': 'first',
-                             'time_mmss_millis': 'first',
-                             'comment': first_nonempty_comment}
+                            'absolute_time': 'first',
+                            'time_s': 'first',
+                            'time_mmss_millis': 'first'}
                         ).reset_index(drop=True)
-                        # Ensure Excel-friendly dtypes
-                        if 'comment' in resampled.columns:
-                            resampled['comment'] = resampled['comment'].astype(object)
+
+                        # --- recompute timing from absolute_time ---
+                        abs_time = pd.to_datetime(resampled['absolute_time'])
+                        time_diff = abs_time.diff().dt.total_seconds().fillna(0)
+                        time_s_fixed = time_diff.cumsum()
+                        time_mmss_millis_fixed = time_s_fixed.apply(sec_to_mmss_millis)
+
+                        resampled['Datetime'] = abs_time
+                        resampled['Elapsed Time (s)'] = time_s_fixed
+                        resampled['Elapsed Time (mm:ss.ms)'] = time_mmss_millis_fixed
+
+                        # Drop old cols
+                        resampled = resampled.drop(columns=['absolute_time', 'time_s', 'time_mmss_millis'], errors="ignore")
+
+                        # === Insert comments ONLY once at their real absolute time ===
+                        comment_rows = []
+                        if df_comments is not None and not df_comments.empty:
+                            t0_dt = abs_time.iloc[0]
+                            for _, ev in df_comments.iterrows():
+                                abs_t = pd.to_datetime(ev["absolute_time"])
+                                comment_text = str(ev["comment_text"])
+                                elapsed_sec = (abs_t - t0_dt).total_seconds()
+
+                                comment_rows.append({
+                                    "Datetime": abs_t,
+                                    "Elapsed Time (s)": elapsed_sec,
+                                    "Elapsed Time (mm:ss.ms)": sec_to_mmss_millis(elapsed_sec),
+                                    "comment": comment_text,
+                                    **{c: np.nan for c in all_signals}
+                                })
+
+                        if comment_rows:
+                            resampled = pd.concat([resampled, pd.DataFrame(comment_rows)], ignore_index=True)
+
+                            # Merge rows with same Datetime (keep numeric values, merge comments)
+                            resampled = (
+                                resampled.groupby("Datetime", as_index=False)
+                                .agg(lambda x: " ".join([str(i) for i in x.dropna().unique()]) if x.dtype == object else x.mean())
+                            )
+
+                        # Sort by time
+                        resampled = resampled.sort_values("Datetime").reset_index(drop=True)
+
+                        # Ensure Excel-friendly dtype
+                        resampled['comment'] = resampled.get('comment', pd.Series(dtype=object)).astype(object)
+
+                        # Final column order
+                        ordered_cols = (
+                            ['Datetime', 'Elapsed Time (s)', 'Elapsed Time (mm:ss.ms)', 'comment'] +
+                            [c for c in all_signals if c in resampled.columns]
+                        )
+                        resampled = resampled.reindex(columns=ordered_cols)                        # Export
                         sheet_name = f"Resampled({selected_label})"
                         resampled.to_excel(writer, index=False, sheet_name=sheet_name[:31])
-
-
             buffer.seek(0)
+
+            # --- Filename ---
+            if beat_mode:
+                suffix = f"{beats_k}beats"
+            else:
+                label_to_sec = {
+                    "500ms": "500ms", "1 sec": "1sec", "2 sec": "2sec", "5 sec": "5sec",
+                    "10 sec": "10sec", "15 sec": "15sec", "30 sec": "30sec", "1 min": "1min"
+                }
+                current_choice = st.session_state.get('bin_choice_label', None)
+                selected_label = current_choice if current_choice in label_to_sec else st.session_state.get('last_time_bin_label', '1 min')
+                suffix = label_to_sec.get(selected_label, "resampled")
+
+            file_name = f"{suffix}_{file_base}.xlsx"
+
             st.download_button(
                 label="Download Excel",
                 data=buffer.getvalue(),
-                file_name=f"{file_base}_export.xlsx",
+                file_name=file_name,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
-
+                    
 # Footer
 st.markdown("---")
 col1, col2 = st.columns([0.7, 0.4])
