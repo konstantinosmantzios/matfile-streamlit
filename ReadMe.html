@@ -269,12 +269,16 @@ Everything happens through the <strong>Streamlit web interface</strong>:</p>
 <p><strong>Beat-based</strong>: produces one row for <strong>each detected beat</strong> (separately for Finger Pressure and CBF).</p>
 <ul>
 <li>Each channel keeps its own beat timing (Finapress and CBF beats do not align exactly).</li>
-<li>For every beat, the value shown is the <strong>mean of the previous N detected beats</strong> (e.g., 5 or 10).</li>
-<li>This way, each row represents a real detected beat, with smoothed values that reflect the recent history of that signal.<br>
+<li>For every beat, the value shown is the <strong>mean of N beats centered around it</strong>.<br>
+Example:<br>
+• With 5-beat smoothing → each data point is the average of the current beat plus the 2 beats before and the 2 beats after.<br>
+• With 10-beat smoothing → each data point is the average of the current beat plus the 4 beats before and the 4 beats after.</li>
+<li>This avoids the lag effect of using only previous beats and gives a more balanced, real-time representation.<br>
 <em>Useful for comparing cardiac cycles directly while accounting for natural timing differences.</em></li>
 </ul>
 </li>
 </ul>
+<p><img src="file:////Users/geogkikas/Library/CloudStorage/GoogleDrive-ggkikas77@gmail.com/.shortcut-targets-by-id/10-7154j_VAXBZuTkSEzZ4FJEqN-ckuZR/Mantzios - Gkikas/Labchart_txt_copenhagen/Git ReadMatFile/Users/geogkikas/Downloads/5beat_example.png" alt="Example of 5-beat smoothing"></p>
 <p>⚠️ <strong>Important</strong>: Comments are preserved at their exact time, even if no other data is present.</p>
 <p> </p>
 <h2 id="-exported-excel-sheets">📂 Exported Excel Sheets</h2>
