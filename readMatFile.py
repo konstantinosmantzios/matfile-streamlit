@@ -1122,15 +1122,18 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
                                 arr[valid] = 1
                             return arr
 
-                        merged_cols = {
-                            'Datetime': df['absolute_time'],
-                            'Elapsed Time (s)': time_s_fixed,
-                            'Elapsed Time (mm:ss.ms)': time_mmss_millis_fixed,
-                            'Comment': df['comment'],
-                            'local_high_FP': _peaks_flag(len(df), peaks_fp),
-                            'local_high_CBF': _peaks_flag(len(df), peaks_cbf),
-                        }
+                        # Reference start time
+                        t0_dt = pd.to_datetime(df['absolute_time'].iloc[0])
 
+                        merged_cols = {
+                            "Datetime": df["absolute_time"],
+                            "Elapsed Time (s)": (pd.to_datetime(df["absolute_time"]) - t0_dt).dt.total_seconds(),
+                            "Elapsed Time (mm:ss.ms)": (pd.to_datetime(df["absolute_time"]) - t0_dt).dt.total_seconds().apply(sec_to_mmss_millis),
+                            "comment": df["comment"],
+                            "local_high_FP": _peaks_flag(len(df), peaks_fp),
+                            "local_high_CBF": _peaks_flag(len(df), peaks_cbf),
+                        }
+                        
                         for sig in all_signals:
                             series = agg5_moving_map.get(sig, None)
                             if series is not None:
@@ -1154,10 +1157,12 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
                             (df_resampled['comment'].notna())
                         ]
                         df_resampled = df_resampled.drop(columns=['local_high_FP', 'local_high_CBF'])
+                        # Identify which columns are signals (exclude timing + comment)
+                        non_signal_cols = ['Datetime', 'Elapsed Time (s)', 'Elapsed Time (mm:ss.ms)', 'comment']
+
+                        # For comment rows, blank out only the signal values
                         df_resampled.loc[df_resampled['comment'].notna(),
-                                        df_resampled.columns.difference(
-                                            ['absolute_time', 'time_s', 'time_mmss_millis', 'comment']
-                                        )] = np.nan
+                                        df_resampled.columns.difference(non_signal_cols)] = np.nan
 
                         sheet_name = f"Resampled({beats_k}beats)"
                         df_resampled.to_excel(writer, index=False, sheet_name=sheet_name[:31])
