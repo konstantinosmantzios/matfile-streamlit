@@ -100,9 +100,14 @@ Since raw signals are at **200 Hz** (very high frequency), you can reduce them i
 
  - **Beat-based**: produces one row for **each detected beat** (separately for Finger Pressure and CBF).  
    - Each channel keeps its own beat timing (Finapress and CBF beats do not align exactly).  
-   - For every beat, the value shown is the **mean of the previous N detected beats** (e.g., 5 or 10).  
-   - This way, each row represents a real detected beat, with smoothed values that reflect the recent history of that signal.  
+   - For every beat, the value shown is the **mean of N beats centered around it**.  
+     Example:  
+     • With 5-beat smoothing → each data point is the average of the current beat plus the 2 beats before and the 2 beats after.  
+     • With 10-beat smoothing → each data point is the average of the current beat plus the 4 beats before and the 4 beats after.  
+   - This avoids the lag effect of using only previous beats and gives a more balanced, real-time representation.  
    *Useful for comparing cardiac cycles directly while accounting for natural timing differences.*  
+
+![Example of 5-beat smoothing](images/5beat_example.png)
 
 ⚠️ **Important**: Comments are preserved at their exact time, even if no other data is present.  
 

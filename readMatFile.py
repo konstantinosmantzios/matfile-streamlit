@@ -674,7 +674,7 @@ if uploaded_mat:
                     # ===== Build moving and block averages for ALL signals (including fallback) using priority-derived peaks =====
                     signals_to_process = list(all_signals)
                     agg5_moving_map = {}
-                    agg5_block_map  = {}
+                    # agg5_block_map  = {}
 
                     # Precompute moving window segment boundaries from peaks (independent of signal)
                     N = len(sig0_filt)
@@ -708,22 +708,22 @@ if uploaded_mat:
                         else:
                             peaks_used = peaks
 
-                        # --- Moving (overlapping) K-peak mean (TRAILING: mean of previous K beats) ---
+                        # --- Moving (overlapping) K-peak mean (CENTERED: mean around current beat) ---
                         agg_m = np.full(Nsig, np.nan, dtype=float)
                         if peaks_used.size >= beats_k:
                             nP = peaks_used.size
-                            # Midpoints between consecutive peaks define segment boundaries
                             mids_used = np.rint((peaks_used[:-1] + peaks_used[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
-                            for i in range(beats_k - 1, nP):
-                                # trailing mean from beat i-(K-1) to i
-                                i0 = peaks_used[i - (beats_k - 1)]
-                                i1 = peaks_used[i]
+                            half_k = beats_k // 2
+                            for i in range(half_k, nP - (beats_k - half_k - 1)):
+                                # centered mean from beat i-half_k to i+half_k
+                                i0 = peaks_used[i - half_k]
+                                i1 = peaks_used[i + (beats_k - half_k - 1)]
                                 if i1 < i0:
                                     i0, i1 = i1, i0
                                 mval = float(np.nanmean(y[i0:i1+1]))
                                 # assign from midpoint(prev,current) to midpoint(current,next)
-                                seg_start = 0 if i == 0 else int(mids_used[i - 1])
-                                seg_end   = Nsig if i == (nP - 1) else int(mids_used[i])
+                                seg_start = 0 if i == 0 else int(mids_used[i - 1]) if i - 1 < len(mids_used) else 0
+                                seg_end = Nsig if i == (nP - 1) else int(mids_used[i]) if i < len(mids_used) else Nsig
                                 s = max(0, seg_start)
                                 e = min(Nsig, seg_end)
                                 if e > s:
@@ -753,7 +753,7 @@ if uploaded_mat:
                             agg_b[min(i0, i1):Nsig] = final_mean
 
                         agg5_moving_map[sig_name] = agg_m
-                        agg5_block_map[sig_name]  = agg_b
+                        # agg5_block_map[sig_name]  = agg_b
 
                     # Also compute/store for the priority signal itself
                     y0 = sig0_filt
@@ -761,14 +761,15 @@ if uploaded_mat:
                     if peaks.size >= beats_k:
                         nP = peaks.size
                         mids = np.rint((peaks[:-1] + peaks[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
-                        for i in range(beats_k - 1, nP):
-                            i0 = peaks[i - (beats_k - 1)]
-                            i1 = peaks[i]
+                        half_k = beats_k // 2
+                        for i in range(half_k, nP - (beats_k - half_k - 1)):
+                            i0 = peaks[i - half_k]
+                            i1 = peaks[i + (beats_k - half_k - 1)]
                             if i1 < i0:
                                 i0, i1 = i1, i0
                             mval = float(np.nanmean(y0[i0:i1+1]))
-                            seg_start = 0 if i == 0 else int(mids[i - 1])
-                            seg_end   = N if i == (nP - 1) else int(mids[i])
+                            seg_start = 0 if i == 0 else int(mids[i - 1]) if i - 1 < len(mids) else 0
+                            seg_end = N if i == (nP - 1) else int(mids[i]) if i < len(mids) else N
                             s = max(0, seg_start)
                             e = min(N, seg_end)
                             if e > s:
@@ -795,7 +796,7 @@ if uploaded_mat:
                         agg_b[min(i0, i1):N] = final_mean
 
                     agg5_moving_map[main_signal] = agg_m
-                    agg5_block_map[main_signal]  = agg_b
+                    # agg5_block_map[main_signal]  = agg_b
 
                     # Store to session
                     st.session_state.df = df
@@ -804,7 +805,7 @@ if uploaded_mat:
                     st.session_state.beats_k = beats_k
                     st.session_state.beat_signal_name = main_signal
                     st.session_state.agg5_moving_map = agg5_moving_map
-                    st.session_state.agg5_block_map = agg5_block_map
+                    # st.session_state.agg5_block_map = agg5_block_map
                     st.session_state.sig0_filt = sig0_filt
                     st.session_state.peaks_idx = peaks
                     if 'peaks_cbf' in locals():
@@ -891,14 +892,15 @@ if uploaded_mat:
                     if peaks.size >= beats_k:
                         nP = peaks.size
                         mids = np.rint((peaks[:-1] + peaks[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
-                        for i in range(beats_k - 1, nP):
-                            i0 = peaks[i - (beats_k - 1)]
-                            i1 = peaks[i]
+                        half_k = beats_k // 2
+                        for i in range(half_k, nP - (beats_k - half_k - 1)):
+                            i0 = peaks[i - half_k]
+                            i1 = peaks[i + (beats_k - half_k - 1)]
                             if i1 < i0:
                                 i0, i1 = i1, i0
                             mval = float(np.nanmean(sig0_filt[i0:i1+1]))
-                            seg_start = 0 if i == 0 else int(mids[i - 1])
-                            seg_end   = len(sig0_filt) if i == (nP - 1) else int(mids[i])
+                            seg_start = 0 if i == 0 else int(mids[i - 1]) if i - 1 < len(mids) else 0
+                            seg_end = len(sig0_filt) if i == (nP - 1) else int(mids[i]) if i < len(mids) else len(sig0_filt)
                             s = max(0, seg_start)
                             e = min(len(sig0_filt), seg_end)
                             if e > s:
@@ -1004,14 +1006,14 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
         ))
     else:
         agg5_moving_map = st.session_state.get('agg5_moving_map', {})
-        agg5_block_map  = st.session_state.get('agg5_block_map', {})
+        # agg5_block_map  = st.session_state.get('agg5_block_map', {})
         # Choose correct peaks for markers: CBF uses its own peaks
         if plot_signal == fallback_signal:
             peaks_idx = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
         else:
             peaks_idx = st.session_state.get('peaks_idx', np.array([], dtype=int))
         series_m = agg5_moving_map.get(plot_signal, None)
-        series_b = agg5_block_map.get(plot_signal, None)
+        # series_b = agg5_block_map.get(plot_signal, None)
         if series_m is not None and np.isfinite(series_m).any():
             fig.add_trace(go.Scatter(
                 x=df['time_s'], y=series_m, mode='lines', name=f'Moving mean ({beats_k} peaks)',
