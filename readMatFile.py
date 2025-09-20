@@ -562,6 +562,12 @@ if uploaded_mat:
                     for col in all_signals:
                         if col != fallback_signal:  # do not mask ch18 here; handled separately
                             df.loc[mask, col] = np.nan
+                        
+                    # 👇 Add here
+                    if "2: MAP" or "3: Systolic" or "4: Diastolic" in df.columns:
+                        df["2: MAP"] = df["2: MAP"].replace(0, np.nan)
+                        df["3: Systolic"] = df["3: Systolic"].replace(0, np.nan)
+                        df["4: Diastolic"] = df["4: Diastolic"].replace(0, np.nan)
                 else:
                     st.warning("AutoCal gating column not found (e.g., '11: AutoCal Countdown'). Proceeding without AutoCal masking.")
 
