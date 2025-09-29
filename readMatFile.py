@@ -383,7 +383,7 @@ if uploaded_mat:
     df_channel_info = channel_info_df(mat)
     df_comments = comments_df(mat, df_channel_info)
     # print(df_channel_info)
-    # print(df_comments)
+    print(df_comments)
     
     df = extract_channel_signals_with_comments(mat, df_comments)
     all_columns = list(df.columns)
@@ -431,6 +431,16 @@ if uploaded_mat:
 
     # Only show the filtering controls if '1: Finger Pressure' is present
     if main_signal == priority_signal:
+        # --- Auto Calibration Option ---
+        st.markdown("### Auto Calibration")
+        auto_cal_option = st.radio(
+            "Auto Calibration",
+            ["Enabled", "Disabled"],
+            index=1,
+            horizontal=True,
+            key="auto_cal_option",
+            # help="Choose whether to apply Auto Calibration masking. Default is Disabled."
+        )
         with st.expander("Finger Pressure – Filtering Options", expanded=False):
             st.markdown(
                 "These settings help remove noise and sudden jumps from the Finger Pressure signal. "
@@ -549,20 +559,53 @@ if uploaded_mat:
                 df['unfiltered_signal'] = df[main_signal].copy()
                 autocal_col = find_autocal_column(df)
                 if autocal_col is not None:
-                    st.caption(f"AutoCal gating: using column **{autocal_col}** (< 0.5 masked)")
-                    try:
-                        mask = df[autocal_col].astype(float) < 0.5
-                    except Exception:
-                        # Fallback for non-numeric/boolean encodings
-                        mask = (df[autocal_col] == 0) | (df[autocal_col] == False)
+                    st.caption(f"AutoCal gating: using column **{autocal_col}** (masking logic based on Auto Calibration setting)")
+                    auto_cal_option = st.session_state.get("auto_cal_option", "Disabled")
+                    mask = None
+                    if auto_cal_option == "Enabled":
+                        try:
+                            mask = df[autocal_col].astype(float) < 0.5
+                        except Exception:
+                            # Fallback for non-numeric/boolean encodings
+                            mask = (df[autocal_col] == 0) | (df[autocal_col] == False)
+                    elif auto_cal_option == "Disabled":
+                        # Mask from 'HCU not connected' comment forward until autocal_col > 0.5
+                        mask = np.zeros(len(df), dtype=bool)
+                        if df_comments is not None and not df_comments.empty:
+                            n_blocks = len(mat["blocktimes"])
+                            # Compute block offsets for global indexing
+                            block_lengths = []
+                            for _, row in df_channel_info.iterrows():
+                                if row["title"] == autocal_col and row.get("datastart") is not None:
+                                    block_lengths = [int(e-s+1) for s, e in zip(row["datastart"], row["dataend"])]
+                                    break
+                            if not block_lengths:
+                                # fallback: use length of df divided by n_blocks
+                                block_lengths = [len(df) // n_blocks] * n_blocks
+                            block_offsets = np.cumsum([0] + block_lengths[:-1])
+                            # Find all comments with "HCU not connected"
+                            matches = df_comments[df_comments["comment_text"] == "HCU not connected"]
+                            for _, ev in matches.iterrows():
+                                block_index = int(ev["block_index"]) - 1
+                                sample_index = int(ev["sample_index"])
+                                if 0 <= block_index < len(block_offsets):
+                                    idx_global = block_offsets[block_index] + sample_index
+                                    # Mask from idx_global forward until autocal_col > 0.5
+                                    for i in range(idx_global, len(df)):
+                                        try:
+                                            val = float(df[autocal_col].iloc[i])
+                                        except Exception:
+                                            val = 0.0 if (df[autocal_col].iloc[i] == 0 or df[autocal_col].iloc[i] == False) else 1.0
+                                        if val > 0.5:
+                                            break
+                                        mask[i] = True
                     # Ensure numeric signals are float to safely receive NaNs
                     for col in all_signals:
                         if col != fallback_signal:
                             df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
                     for col in all_signals:
-                        if col != fallback_signal:  # do not mask ch18 here; handled separately
+                        if col != fallback_signal:
                             df.loc[mask, col] = np.nan
-                        
                     # 👇 Add here
                     if "2: MAP" or "3: Systolic" or "4: Diastolic" in df.columns:
                         df["2: MAP"] = df["2: MAP"].replace(0, np.nan)
