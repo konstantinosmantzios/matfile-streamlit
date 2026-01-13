@@ -366,13 +366,18 @@ def median_filter(    # Rolling window and thresholds
 
 uploaded_mat = st.file_uploader("Upload a MATLAB .mat file", type=["mat"])
 
-# Clear session state on new upload
-if uploaded_mat:
-    if 'last_uploaded_name' not in st.session_state or st.session_state.last_uploaded_name != uploaded_mat.name:
-        for key in ['df', 'result_df', 'all_signals']:
-            if key in st.session_state:
-                del st.session_state[key]
+# --- FULL reset on new file upload ---
+if uploaded_mat is not None:
+    if st.session_state.get("last_uploaded_name") != uploaded_mat.name:
+        # Clear ALL session state except the uploaded filename
+        for key in list(st.session_state.keys()):
+            del st.session_state[key]
+
+        # Store current filename to detect future changes
         st.session_state.last_uploaded_name = uploaded_mat.name
+
+        # Force Streamlit to rerun cleanly
+        st.rerun()
 
 if uploaded_mat:
     file_name = uploaded_mat.name
@@ -416,7 +421,7 @@ if uploaded_mat:
     st.markdown("### Settings")
     bin_choice = st.radio("Sample Rate", [
         "500ms", "1 sec", "2 sec", "5 sec", "10 sec", "15 sec", "30 sec", "1 min", "5beats", "10beats"
-    ], index=1, horizontal=True)
+    ], index=8, horizontal=True)
     st.session_state['bin_choice_label'] = bin_choice
     bin_map = {
         "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
@@ -1025,62 +1030,309 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
     #         yaxis='y2', line=dict(width=1)
     #     ))
 
-    if plot_signal == fallback_signal:
-        fig.add_trace(go.Scatter(
-            x=df['time_s'], y=df['unfiltered_signal_Ch_18'], mode='lines', name='Raw (unfiltered)',
-            line=dict(color='rgba(200,200,200,0.5)', width=1)
-        ))
+    # === Add stats view toggle ===
+    show_stats_view = st.checkbox("Enable Stats View (hide other lines)", value=False)
 
-    elif plot_signal in ['1: Finger Pressure',	'2: MAP', '3: Systolic',	'4: Diastolic']:
-        if plot_signal == '1: Finger Pressure':
-            raw_name = "Raw (unfiltered)"
-        else:
-            raw_name = "Raw (Finger Pressure)"
+    # Only show Raw and Filtered traces if stats view is disabled
+    if not show_stats_view:
+        if plot_signal == fallback_signal:
+            fig.add_trace(go.Scatter(
+                x=df['time_s'], y=df['unfiltered_signal_Ch_18'], mode='lines', name='Raw (unfiltered)',
+                line=dict(color='rgba(200,200,200,0.5)', width=1)
+            ))
+        elif plot_signal in ['1: Finger Pressure', '2: MAP', '3: Systolic', '4: Diastolic']:
+            if plot_signal == '1: Finger Pressure':
+                raw_name = "Raw (unfiltered)"
+            else:
+                raw_name = "Raw (Finger Pressure)"
+            fig.add_trace(go.Scatter(
+                x=df['time_s'], y=df['unfiltered_signal'], mode='lines', name=raw_name,
+                line=dict(color='rgba(200,200,200,0.5)', width=1)
+            ))
         fig.add_trace(go.Scatter(
-            x=df['time_s'], y=df['unfiltered_signal'], mode='lines', name=raw_name,
-            line=dict(color='rgba(200,200,200,0.5)', width=1)
-        ))
-
-    fig.add_trace(go.Scatter(
-        x=df['time_s'], y=df[plot_signal], mode='lines', name='Filtered',
-        line=dict(color='cyan', width=1,),
-        hovertemplate="Time: %{customdata}<br>Value: %{y}<extra></extra>",
-        customdata=df['time_s'].apply(sec_to_mmss_millis)
-    ))    
-    
-    if not beat_mode and result_df is not None:
-        fig.add_trace(go.Scatter(
-            x=result_df['time_s'], y=result_df[plot_signal], mode='lines', name='Aggregated',
-            line=dict(color='orange', width=2.5)
+            x=df['time_s'], y=df[plot_signal], mode='lines', name='Filtered',
+            line=dict(color='cyan', width=1,),
+            hovertemplate="Time: %{customdata}<br>Value: %{y}<extra></extra>",
+            customdata=df['time_s'].apply(sec_to_mmss_millis)
         ))
     else:
-        agg5_moving_map = st.session_state.get('agg5_moving_map', {})
-        # agg5_block_map  = st.session_state.get('agg5_block_map', {})
+        # --- Stats view: show moving mean, but add other lines as legendonly ---
+        # Add moving mean line (same as in non-stats view, but always shown)
+        series_m = None
+        times = None
+        if beat_mode:
+            agg5_moving_map = st.session_state.get('agg5_moving_map', {})
+            series_m = agg5_moving_map.get(plot_signal, None)
+            times = df['time_s'].values
+        elif result_df is not None and plot_signal in result_df.columns:
+            series_m = result_df[plot_signal].values
+            times = result_df['time_s'].values
+        if series_m is not None:
+            fig.add_trace(go.Scatter(
+                x=df['time_s'], y=series_m, mode='lines', name='Moving Mean',
+                line=dict(color='orange', width=3)
+            ))
+        # Add Raw and Filtered lines, but set visible='legendonly'
+        # Raw
+        if plot_signal == fallback_signal:
+            fig.add_trace(go.Scatter(
+                x=df['time_s'], y=df['unfiltered_signal_Ch_18'], mode='lines', name='Raw (unfiltered)',
+                line=dict(color='rgba(200,200,200,0.5)', width=1),
+                visible='legendonly'
+            ))
+        elif plot_signal in ['1: Finger Pressure', '2: MAP', '3: Systolic', '4: Diastolic']:
+            if plot_signal == '1: Finger Pressure':
+                raw_name = "Raw (unfiltered)"
+            else:
+                raw_name = "Raw (Finger Pressure)"
+            fig.add_trace(go.Scatter(
+                x=df['time_s'], y=df['unfiltered_signal'], mode='lines', name=raw_name,
+                line=dict(color='rgba(200,200,200,0.5)', width=1),
+                visible='legendonly'
+            ))
+        # Filtered
+        fig.add_trace(go.Scatter(
+            x=df['time_s'], y=df[plot_signal], mode='lines', name='Filtered',
+            line=dict(color='cyan', width=1,),
+            hovertemplate="Time: %{customdata}<br>Value: %{y}<extra></extra>",
+            customdata=df['time_s'].apply(sec_to_mmss_millis),
+            visible='legendonly'
+        ))
+        # Local Highs markers, legendonly
         # Choose correct peaks for markers: CBF uses its own peaks
         if plot_signal == fallback_signal:
             peaks_idx = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
         else:
             peaks_idx = st.session_state.get('peaks_idx', np.array([], dtype=int))
-        series_m = agg5_moving_map.get(plot_signal, None)
-        # series_b = agg5_block_map.get(plot_signal, None)
-        if series_m is not None and np.isfinite(series_m).any():
-            fig.add_trace(go.Scatter(
-                x=df['time_s'], y=series_m, mode='lines', name=f'Moving mean ({beats_k} peaks)',
-                line=dict(color='orange', width=3)
-            ))
-        # if series_b is not None and np.isfinite(series_b).any():
-        #     fig.add_trace(go.Scatter(
-        #         x=df['time_s'], y=series_b, mode='lines', name=f'Block average (per {beats_k} beats)',
-        #         line=dict(width=3)
-        #     ))
         if peaks_idx.size > 0 and plot_signal in ['1: Finger Pressure', '6: CBF']:
             fig.add_trace(go.Scatter(
                 x=df['time_s'].iloc[peaks_idx],
                 y=df[plot_signal].iloc[peaks_idx],
                 mode='markers',
                 name='Local Highs',
-                marker=dict(size=6, color='orange', symbol='circle-open')
+                marker=dict(size=6, color='orange', symbol='circle-open'),
+                visible='legendonly'
             ))
+
+    # === Add horizontal mean lines and peak markers for "Standing" comments if plotting Finger Pressure or CBF ===
+    if show_stats_view:
+        if plot_signal in ['1: Finger Pressure', '6: CBF']:
+            
+            # Find all comment rows containing "Standing"
+            standing_comments = df[df['comment'].astype(str).str.strip() == "Standing"]
+            baseline_window = st.number_input("Baseline window (seconds)", min_value=10, max_value=600, value=120, step=10, help="Represents the time window for computing the baseline mean. The window ends at the moment the 'Standing' comment is made.")
+
+
+            # ---- Fixed-window parameter (defined once to avoid Streamlit duplicate IDs) ----
+            analysis_window_sec = st.number_input(
+                "Analysis window after Standing (seconds)",
+                min_value=1,
+                max_value=30,
+                value=10,
+                step=1,
+                key="fixed_window_after_standing_sec"
+            )
+
+            # ---- Area computation option ----
+            only_below_start = st.checkbox(
+                "Compute area only below Standing value",
+                value=True,
+                help="If enabled, only deviations below the Standing start value are shaded and integrated."
+            )
+
+            use_baseline_as_ref = st.checkbox(
+                "Use baseline mean as reference (instead of Vstart)",
+                value=False,
+                help="If enabled, baseline mean before Standing is used as the reference for drop and area computations."
+            )
+
+            for _, row_stand in standing_comments.iterrows():
+                comment_time = row_stand['time_s']
+
+                # --- red Line 1: mean before Standing ---
+                mask_red_pre = (times >= comment_time - baseline_window) & (times <= comment_time)
+                mean_val_red_pre = np.nanmean(series_m[mask_red_pre]) if series_m is not None else np.nan
+                if np.isfinite(mean_val_red_pre):
+                    fig.add_trace(go.Scatter(
+                        x=[comment_time - baseline_window, comment_time],
+                        y=[mean_val_red_pre, mean_val_red_pre],
+                        mode='lines',
+                        line=dict(color='blue', width=3),
+                        name='Baseline Mean',
+                        showlegend=False
+                    ))
+
+                # ---- Fixed-window advanced statistics (relative to Standing comment) ----
+                # fixed_window_sec is now defined once above, outside the loop
+
+                if series_m is not None and times is not None:
+                    # Fixed window: [Standing time, Standing time + fixed_window_sec]
+                    t_start = comment_time
+                    t_end = comment_time + analysis_window_sec
+
+                    mask_win = (times >= t_start) & (times <= t_end)
+                    t_segment = times[mask_win]
+                    y_segment = series_m[mask_win]
+
+                    if len(t_segment) < 2 or not np.isfinite(y_segment).any():
+                        continue
+
+                    # Reference value for computations
+                    # --- Reference value for computations ---
+                    if use_baseline_as_ref and np.isfinite(mean_val_red_pre):
+                        ref_value = mean_val_red_pre
+                        ref_label = "Baseline"
+                    else:
+                        ref_value = y_segment[0]
+                        ref_label = "V<sub>start</sub>"
+                    analysis_window_start_value = y_segment[0]
+                    analysis_window_end_value = y_segment[-1]
+
+                    if not np.isfinite(ref_value):
+                        continue
+
+                    # --- Shading relative to reference value ---
+                    # Below reference (red)
+                    y_below = np.minimum(y_segment, ref_value)
+
+                    fig.add_trace(go.Scatter(
+                        x=np.concatenate([t_segment, t_segment[::-1]]),
+                        y=np.concatenate([y_below, np.full_like(y_below, ref_value)]),
+                        fill='toself',
+                        fillcolor='rgba(255,0,0,0.25)',
+                        line=dict(color='rgba(255,0,0,0.5)', width=1),
+                        name='Below start',
+                        showlegend=False
+                    ))
+
+                    # Above reference (green) — only if enabled
+                    if not only_below_start:
+                        y_above = np.maximum(y_segment, ref_value)
+
+                        fig.add_trace(go.Scatter(
+                            x=np.concatenate([t_segment, t_segment[::-1]]),
+                            y=np.concatenate([y_above, np.full_like(y_above, ref_value)]),
+                            fill='toself',
+                            fillcolor='rgba(0,200,0,0.25)',
+                            line=dict(color='rgba(0,200,0,0.5)', width=1),
+                            name='Above start',
+                            showlegend=False
+                        ))
+
+                    # Start / End markers (Standing → Standing + window)
+                    fig.add_trace(go.Scatter(
+                        x=[t_start],
+                        y=[ref_value],
+                        mode='markers',
+                        marker=dict(size=12, color='lime', symbol='diamond'),
+                        showlegend=False,
+                        name='Start of Analysis Window'
+                    ))
+                    fig.add_trace(go.Scatter(
+                        x=[t_end],
+                        y=[y_segment[-1]],
+                        mode='markers',
+                        marker=dict(size=12, color='lime', symbol='diamond'),
+                        showlegend=False,
+                        name='End of Analysis Window'
+                    ))
+                    
+
+                    # Metrics (relative to reference value)
+                    duration_ms = analysis_window_sec * 1000
+                    # --- Minimum used for DROP computation ---
+                    if only_below_start:
+                        valid_mask = y_segment < ref_value
+                    else:
+                        valid_mask = np.isfinite(y_segment)
+
+                    if np.any(valid_mask):
+                        min_val = np.nanmin(y_segment[valid_mask])
+                        idx_min = np.nanargmin(y_segment[valid_mask])
+                        t_min = t_segment[valid_mask][idx_min]
+                    else:
+                        min_val = np.nan
+                        t_min = np.nan
+                    # --- Red triangle: minimum used for DROP ---
+                    if np.isfinite(min_val):
+                        fig.add_trace(go.Scatter(
+                            x=[t_min],
+                            y=[min_val],
+                            mode='markers',
+                            marker=dict(size=16, color='red', symbol='triangle-down'),
+                            name='Drop minimum',
+                            showlegend=False
+                        ))
+                    perc_drop = ((ref_value - min_val) / ref_value) * 100 if ref_value != 0 else np.nan
+                    if only_below_start:
+                        diff = np.maximum(ref_value - y_segment, 0)
+                    else:
+                        diff = ref_value - y_segment
+                    area_raw = np.trapz(diff, t_segment)
+                    area_rel = area_raw / ref_value if ref_value != 0 else np.nan
+
+                    fig.add_annotation(
+                        x=t_start + analysis_window_sec / 2,
+                        xref='x',
+                        y=0.98,
+                        yref='paper',
+                        text=(
+                            f"<b>Standing Response:</b><br>"
+                            f"B<sub>mean</sub>: {mean_val_red_pre:.2f}<br>"
+                            f"T: {duration_ms/1000:.0f} sec<br>"
+                            f"{ref_label}: {ref_value:.2f}<br>"
+                            f"V<sub>end</sub>: {analysis_window_end_value:.2f}<br>"
+                            f"V<sub>min</sub>: {min_val:.2f}<br>"
+                            f"Drop: {perc_drop:.1f}%<br>"
+                            f"A<sub>abs</sub>{' (below start)' if only_below_start else ''}: {area_raw:.2f} (abs.)<br>"
+                            f"A<sub>rel</sub>{' (below start)' if only_below_start else ''}: {area_rel:.2f} (rel.)"
+                        ),
+                        showarrow=False,
+                        align='left',
+                        font=dict(color='white', size=14),
+                        bgcolor='rgb(80,80,80)',
+                        bordercolor='gray',
+                        borderwidth=1,
+                        borderpad=6,
+                        xanchor='center',
+                        yanchor='top'
+                    )
+    
+    
+    if not show_stats_view:
+        if not beat_mode and result_df is not None:
+            fig.add_trace(go.Scatter(
+                x=result_df['time_s'], y=result_df[plot_signal], mode='lines', name='Aggregated',
+                line=dict(color='orange', width=2.5)
+            ))
+        else:
+            agg5_moving_map = st.session_state.get('agg5_moving_map', {})
+            # agg5_block_map  = st.session_state.get('agg5_block_map', {})
+            # Choose correct peaks for markers: CBF uses its own peaks
+            if plot_signal == fallback_signal:
+                peaks_idx = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
+            else:
+                peaks_idx = st.session_state.get('peaks_idx', np.array([], dtype=int))
+            series_m = agg5_moving_map.get(plot_signal, None)
+            # series_b = agg5_block_map.get(plot_signal, None)
+            if series_m is not None and np.isfinite(series_m).any():
+                fig.add_trace(go.Scatter(
+                    x=df['time_s'], y=series_m, mode='lines', name=f'Moving mean ({beats_k} peaks)',
+                    line=dict(color='orange', width=3)
+                ))
+            # if series_b is not None and np.isfinite(series_b).any():
+            #     fig.add_trace(go.Scatter(
+            #         x=df['time_s'], y=series_b, mode='lines', name=f'Block average (per {beats_k} beats)',
+            #         line=dict(width=3)
+            #     ))
+            if peaks_idx.size > 0 and plot_signal in ['1: Finger Pressure', '6: CBF']:
+                fig.add_trace(go.Scatter(
+                    x=df['time_s'].iloc[peaks_idx],
+                    y=df[plot_signal].iloc[peaks_idx],
+                    mode='markers',
+                    name='Local Highs',
+                    marker=dict(size=6, color='orange', symbol='circle-open')
+                ))
 
     comment_locs = df[df['comment'].notna() & (df['comment'] != '')]
     for _, row_ in comment_locs.iterrows():
@@ -1135,6 +1387,41 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
     )
 
     st.plotly_chart(fig, use_container_width=True)
+
+    if show_stats_view and plot_signal in ['1: Finger Pressure', '6: CBF']:
+        # Add text annotation at the bottom-right corner (updated to match current computation logic)
+        st.markdown(
+            """
+            <div style="text-align:left; font-size:14px; color:white; background-color:rgba(0,0,0,0.65); padding:10px; border-radius:6px; max-width:420px;">
+
+            <b>Baseline mean (B<sub>mean</sub>):</b><br>
+            Mean value in the baseline window before Standing<br>
+            
+            <b>Duration (T):</b><br>
+            T = analysis window (s)<br>
+
+            <b>Start value (V<sub>start</sub>):</b><br>
+            V<sub>start</sub> = signal at Standing time<br>
+
+            <b>End value (V<sub>end</sub>):</b><br>
+            V<sub>end</sub> = signal at V<sub>start</sub> + T<br>
+
+            <b>Min value (V<sub>min</sub>):</b><br>
+            V<sub>min</sub> = min(V(t)) within window<br>
+            
+            <b>Drop (%):</b><br>
+            Drop = (V<sub>start</sub> − V<sub>min</sub>) / V<sub>start</sub> × 100<br>
+
+            <b>Area (absolute):</b><br>
+            A<sub>abs</sub> = ∫ (V<sub>start</sub> − V(t)) dt<br>
+
+            <b>Area (relative):</b><br>
+            A<sub>rel</sub> = A<sub>abs</sub> / V<sub>start</sub>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
+    
 
     # === Excel Export ===
     st.markdown("#### Export data to Excel")
