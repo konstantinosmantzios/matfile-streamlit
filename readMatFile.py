@@ -1268,7 +1268,7 @@ if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.
                         diff = np.maximum(ref_value - y_segment, 0)
                     else:
                         diff = ref_value - y_segment
-                    area_raw = np.trapz(diff, t_segment)
+                    area_raw = np.trapezoid(diff, t_segment)
                     area_rel = area_raw / ref_value if ref_value != 0 else np.nan
 
                     fig.add_annotation(
