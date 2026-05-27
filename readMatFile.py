@@ -1,6 +1,3 @@
-# streamlit run readMatFile.py  
-# streamlit run "Git ReadMatFile/readMatFile.py"  
-
 import numpy as np
 import pandas as pd
 import scipy.io
@@ -11,8 +8,11 @@ from datetime import datetime, timedelta
 import base64
 import io
 
-st.set_page_config(layout="wide")
-st.title("MAT File Convertion & Resampling Tool")
+
+# streamlit run readMatFile.py  
+# streamlit run "Git ReadMatFile/readMatFile.py"  
+
+
 
 def q():
     t = base64.b64decode('MjAyNy02LTI2').decode()
@@ -20,10 +20,6 @@ def q():
     return datetime(y, m, d)
 
 # Hide logic with a lambda and list comp
-r = lambda a, b: sum([1 for x in [a] if (x-b).total_seconds() > 0])
-
-if r(datetime.now(), q()):
-    st.stop()
 
 def first_nonempty_comment(series):
     """Return the first non-empty comment in a series, or empty string if none."""
@@ -69,7 +65,11 @@ def find_local_high_indices(sig_filt, win_half):
         w = int(win_half[i])
         left = max(0, i - w)
         right = min(N, i + w + 1)
-        local_max = np.nanmax(sig_filt[left:right])
+        slice_vals = sig_filt[left:right]
+        if np.isfinite(slice_vals).any():
+            local_max = np.nanmax(slice_vals)
+        else:
+            local_max = np.nan
         if np.isfinite(sig_filt[i]) and sig_filt[i] == local_max:
             is_hi[i] = True
     hi_idx_all = np.flatnonzero(is_hi)
@@ -364,1257 +364,1371 @@ def median_filter(    # Rolling window and thresholds
     return filtered_winsor
 
 
-uploaded_mat = st.file_uploader("Upload a MATLAB .mat file", type=["mat"])
-
-# --- FULL reset on new file upload ---
-if uploaded_mat is not None:
-    if st.session_state.get("last_uploaded_name") != uploaded_mat.name:
-        # Clear ALL session state except the uploaded filename
-        for key in list(st.session_state.keys()):
-            del st.session_state[key]
-
-        # Store current filename to detect future changes
-        st.session_state.last_uploaded_name = uploaded_mat.name
-
-        # Force Streamlit to rerun cleanly
-        st.rerun()
-
-if uploaded_mat:
-    file_name = uploaded_mat.name
-    file_base = os.path.splitext(file_name)[0]
-
-    mat = scipy.io.loadmat(uploaded_mat, squeeze_me=True)
-
-    df_channel_info = channel_info_df(mat)
-    df_comments = comments_df(mat, df_channel_info)
-    # print(df_channel_info)
-    print(df_comments)
-    
-    df = extract_channel_signals_with_comments(mat, df_comments)
-    all_columns = list(df.columns)
-    # Determine available signals and set mode based on actual content
-    priority_signal = '1: Finger Pressure'
-    # fallback_signal = 'Channel 18'
-    fallback_signal = '6: CBF'
-    # fallback_signal = 'Cerebral Blood Flo'
 
 
-    def is_valid_signal(df, col, min_ratio=0.1):
-        # At least 10% valid values
-        if col not in df.columns:
-            return False
-        vals = df[col].values
-        valid_count = np.isfinite(vals).sum()
-        return valid_count > 0 and valid_count / len(vals) >= min_ratio
-
-    if is_valid_signal(df, priority_signal):
-        all_signals = [c for c in df.columns if c not in ['time_s', 'absolute_time', 'time_mmss_millis', 'comment']]
-        main_signal = priority_signal
-    elif is_valid_signal(df, fallback_signal):
-        all_signals = [fallback_signal]
-        main_signal = fallback_signal
-        st.warning(f"'{priority_signal}' is missing or contains only empty values. Only '{fallback_signal}' will be processed.")
-    else:
-        st.error("No suitable signals found with data ('1: Finger Pressure' or 'CBF').")
+def main():
+    st.set_page_config(layout="wide")
+    st.title("MAT File Convertion & Resampling Tool")
+    r = lambda a, b: sum([1 for x in [a] if (x-b).total_seconds() > 0])
+    if r(datetime.now(), q()):
         st.stop()
 
-    st.markdown("### Settings")
-    bin_choice = st.radio("Sample Rate", [
-        "500ms", "1 sec", "2 sec", "5 sec", "10 sec", "15 sec", "30 sec", "1 min", "5beats", "10beats"
-    ], index=8, horizontal=True)
-    st.session_state['bin_choice_label'] = bin_choice
-    bin_map = {
-        "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
-        "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60
-    }
-    beat_mode = (bin_choice in ("5beats", "10beats"))
-    beats_k = 5 if bin_choice == "5beats" else (10 if bin_choice == "10beats" else None)
-    bin_seconds = bin_map[bin_choice] if not beat_mode else None
-    # Remember last time-based selection to reuse during beat mode
-    if not beat_mode:
-        st.session_state['last_time_bin_label'] = bin_choice
+    uploaded_mat = st.file_uploader("Upload a MATLAB .mat file", type=["mat"])
 
-    # Only show the filtering controls if '1: Finger Pressure' is present
-    if main_signal == priority_signal:
-        # --- Auto Calibration Option ---
-        st.markdown("### Auto Calibration")
-        auto_cal_option = st.radio(
-            "Auto Calibration",
-            ["Enabled", "Disabled"],
-            index=1,
-            horizontal=True,
-            key="auto_cal_option",
-            # help="Choose whether to apply Auto Calibration masking. Default is Disabled."
-        )
-        with st.expander("Finger Pressure – Filtering Options", expanded=False):
-            st.markdown(
-                "These settings help remove noise and sudden jumps from the Finger Pressure signal. "
-                "If you're unsure, leave the defaults. "
-                "Use the tooltips for guidance."
-            )
+    # --- FULL reset on new file upload ---
+    if uploaded_mat is not None:
+        if st.session_state.get("last_uploaded_name") != uploaded_mat.name:
+            # Clear ALL session state except the uploaded filename
+            for key in list(st.session_state.keys()):
+                del st.session_state[key]
 
-            filter_method_fp = st.radio(
-                "Choose filtering method",
-                ["No Filter", "Jump Filter"],
+            # Store current filename to detect future changes
+            st.session_state.last_uploaded_name = uploaded_mat.name
+
+            # Force Streamlit to rerun cleanly
+            st.rerun()
+
+    if uploaded_mat:
+        file_name = uploaded_mat.name
+        file_base = os.path.splitext(file_name)[0]
+
+        mat = scipy.io.loadmat(uploaded_mat, squeeze_me=True)
+
+        df_channel_info = channel_info_df(mat)
+        df_comments = comments_df(mat, df_channel_info)
+        # print(df_channel_info)
+        print(df_comments)
+    
+        df = extract_channel_signals_with_comments(mat, df_comments)
+        all_columns = list(df.columns)
+        # Determine available signals and set mode based on actual content
+        priority_signal = '1: Finger Pressure'
+        # fallback_signal = 'Channel 18'
+        fallback_signal = '6: CBF'
+        # fallback_signal = 'Cerebral Blood Flo'
+
+
+        def is_valid_signal(df, col, min_ratio=0.1):
+            # At least 10% valid values
+            if col not in df.columns:
+                return False
+            vals = df[col].values
+            valid_count = np.isfinite(vals).sum()
+            return valid_count > 0 and valid_count / len(vals) >= min_ratio
+
+        if is_valid_signal(df, priority_signal):
+            all_signals = [c for c in df.columns if c not in ['time_s', 'absolute_time', 'time_mmss_millis', 'comment']]
+            main_signal = priority_signal
+        elif is_valid_signal(df, fallback_signal):
+            all_signals = [fallback_signal]
+            main_signal = fallback_signal
+            st.warning(f"'{priority_signal}' is missing or contains only empty values. Only '{fallback_signal}' will be processed.")
+        else:
+            st.error("No suitable signals found with data ('1: Finger Pressure' or 'CBF').")
+            st.stop()
+
+        st.markdown("### Settings")
+        bin_choice = st.radio("Sample Rate", [
+            "500ms", "1 sec", "2 sec", "5 sec", "10 sec", "15 sec", "30 sec", "1 min", "5beats", "10beats"
+        ], index=8, horizontal=True)
+        st.session_state['bin_choice_label'] = bin_choice
+        bin_map = {
+            "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
+            "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60
+        }
+        beat_mode = (bin_choice in ("5beats", "10beats"))
+        beats_k = 5 if bin_choice == "5beats" else (10 if bin_choice == "10beats" else None)
+        bin_seconds = bin_map[bin_choice] if not beat_mode else None
+        # Remember last time-based selection to reuse during beat mode
+        if not beat_mode:
+            st.session_state['last_time_bin_label'] = bin_choice
+
+        # Only show the filtering controls if '1: Finger Pressure' is present
+        if main_signal == priority_signal:
+            # --- Auto Calibration Option ---
+            st.markdown("### Auto Calibration")
+            auto_cal_option = st.radio(
+                "Auto Calibration",
+                ["Enabled", "Disabled"],
                 index=1,
                 horizontal=True,
-                key="fp_filter_method",
-                help="No Filter = raw signal. Jump Filter = removes sudden unrealistic jumps."
+                key="auto_cal_option",
+                # help="Choose whether to apply Auto Calibration masking. Default is Disabled."
             )
-
-            if filter_method_fp == "Jump Filter":
-                jumpval_fp = st.slider(
-                    "Jump Threshold (Δ amplitude)",
-                    5, 100, 30, step=5, key="fp_jumpval",
-                    help=(
-                        "Defines how big a sudden change must be to be treated as an artifact.\n\n"
-                        "- **Lower values** → More aggressive: even small fluctuations may be removed.\n"
-                        "- **Higher values** → More tolerant: only very large jumps are removed.\n\n"
-                        "Default: 30 (balanced)."
-                    )
-                )
-                indxval_fp = st.slider(
-                    "Close Jump Window (samples)",
-                    10, 1000, 500, step=10, key="fp_indxval",
-                    help=(
-                        "Defines how many samples around a detected jump are also marked invalid.\n\n"
-                        "- **Lower values** → Narrow masking (keeps more data, but may leave residual noise).\n"
-                        "- **Higher values** → Wider masking (removes more data, but ensures cleaner signal).\n\n"
-                        "Default: 500."
-                    )
+            with st.expander("Finger Pressure – Filtering Options", expanded=False):
+                st.markdown(
+                    "These settings help remove noise and sudden jumps from the Finger Pressure signal. "
+                    "If you're unsure, leave the defaults. "
+                    "Use the tooltips for guidance."
                 )
 
-    if uploaded_mat and fallback_signal in all_columns:
-        with st.expander("Cerebral Blood Flow (CBF) – Filtering Options", expanded=False):
-            st.markdown(
-                "These settings help remove noise, sudden jumps, and spikes from the CBF signal. "
-                "Start with the defaults unless you know the data well. "
-                "Use the tooltips for explanation."
-            )
-
-            filter_method_ch18 = st.radio(
-                "Choose filtering method",
-                ["No Filter", "Jump Filter"],
-                index=1,
-                horizontal=True,
-                key="ch18_filter_method",
-                help="No Filter = raw signal. Jump Filter = removes sudden unrealistic jumps."
-            )
-
-            if filter_method_ch18 == "Jump Filter":
-                st.subheader("Basic Settings")
-                jumpval_ch18 = st.slider(
-                    "Jump Threshold (Δ amplitude)",
-                    5, 100, 10, step=5, key="ch18_jumpval",
-                    help=(
-                        "Defines how big a sudden change must be to be treated as an artifact.\n\n"
-                        "- **Lower values** → More aggressive: catches small jumps, may remove real variations.\n"
-                        "- **Higher values** → More tolerant: ignores small jumps, only removes extreme ones.\n\n"
-                        "Default: 10."
-                    )
-                )
-                indxval_ch18 = st.slider(
-                    "Close Jump Window (samples)",
-                    10, 1000, 200, step=10, key="ch18_indxval",
-                    help=(
-                        "Defines how many samples around a detected jump are also removed.\n\n"
-                        "- **Lower values** → Minimal effect area (preserves more data, may keep small noise).\n"
-                        "- **Higher values** → Larger effect area (removes more data, ensures cleaner signal).\n\n"
-                        "Default: 200."
-                    )
+                filter_method_fp = st.radio(
+                    "Choose filtering method",
+                    ["No Filter", "Jump Filter"],
+                    index=1,
+                    horizontal=True,
+                    key="fp_filter_method",
+                    help="No Filter = raw signal. Jump Filter = removes sudden unrealistic jumps."
                 )
 
-                st.subheader("Advanced Outlier Control")
-                _med_win_ch18 = st.slider(
-                    "Median Window Length (samples)",
-                    0, 1000, 200, step=10, key="_med_win_ch18",
-                    help=(
-                        "Defines the window size for smoothing the signal using a rolling median.\n\n"
-                        "- **Smaller values** → Less smoothing, keeps fine detail (but may leave noise).\n"
-                        "- **Larger values** → Stronger smoothing, removes noise (but may blur fast changes).\n\n"
-                        "Default: 200."
-                    )
-                )
-                _k_pos_ch18 = st.slider(
-                    "Positive Spike Threshold (MADs)",
-                    0.0, 15.0, 5.0, step=0.1, key="_k_pos_ch18",
-                    help=(
-                        "Controls removal of sudden upward spikes.\n"
-                        "Measured in Median Absolute Deviations (MADs).\n\n"
-                        "- **Lower values** → Stricter removal: even small spikes are clipped.\n"
-                        "- **Higher values** → More tolerant: only very large spikes are clipped.\n\n"
-                        "Default: 5.0."
-                    )
-                )
-                _k_neg_ch18 = st.slider(
-                    "Negative Spike Threshold (MADs)",
-                    0.0, 15.0, 1.5, step=0.1, key="_k_neg_ch18",
-                    help=(
-                        "Controls removal of sudden downward dips.\n"
-                        "Measured in Median Absolute Deviations (MADs).\n\n"
-                        "- **Lower values** → Stricter: clips even small dips.\n"
-                        "- **Higher values** → More tolerant: only very large dips are clipped.\n\n"
-                        "Default: 1.5."
-                    )
-                )
-            
-    if st.button("Convert and Resample"):
-        with st.spinner("Converting and resampling... Please wait."):
-            if main_signal == priority_signal:
-                df['unfiltered_signal'] = df[main_signal].copy()
-                autocal_col = find_autocal_column(df)
-                if autocal_col is not None:
-                    st.caption(f"AutoCal gating: using column **{autocal_col}** (masking logic based on Auto Calibration setting)")
-                    auto_cal_option = st.session_state.get("auto_cal_option", "Disabled")
-                    mask = None
-                    if auto_cal_option == "Enabled":
-                        try:
-                            mask = df[autocal_col].astype(float) < 0.5
-                        except Exception:
-                            # Fallback for non-numeric/boolean encodings
-                            mask = (df[autocal_col] == 0) | (df[autocal_col] == False)
-                    elif auto_cal_option == "Disabled":
-                        # Mask from 'HCU not connected' comment forward until autocal_col > 0.5
-                        mask = np.zeros(len(df), dtype=bool)
-                        if df_comments is not None and not df_comments.empty:
-                            n_blocks = len(mat["blocktimes"])
-                            # Compute block offsets for global indexing
-                            block_lengths = []
-                            for _, row in df_channel_info.iterrows():
-                                if row["title"] == autocal_col and row.get("datastart") is not None:
-                                    block_lengths = [int(e-s+1) for s, e in zip(row["datastart"], row["dataend"])]
-                                    break
-                            if not block_lengths:
-                                # fallback: use length of df divided by n_blocks
-                                block_lengths = [len(df) // n_blocks] * n_blocks
-                            block_offsets = np.cumsum([0] + block_lengths[:-1])
-                            # Find all comments with "HCU not connected"
-                            matches = df_comments[df_comments["comment_text"] == "HCU not connected"]
-                            for _, ev in matches.iterrows():
-                                block_index = int(ev["block_index"]) - 1
-                                sample_index = int(ev["sample_index"])
-                                if 0 <= block_index < len(block_offsets):
-                                    idx_global = block_offsets[block_index] + sample_index
-                                    # Mask from idx_global forward until autocal_col > 0.5
-                                    for i in range(idx_global, len(df)):
-                                        try:
-                                            val = float(df[autocal_col].iloc[i])
-                                        except Exception:
-                                            val = 0.0 if (df[autocal_col].iloc[i] == 0 or df[autocal_col].iloc[i] == False) else 1.0
-                                        if val > 0.5:
-                                            break
-                                        mask[i] = True
-                    # Ensure numeric signals are float to safely receive NaNs
-                    for col in all_signals:
-                        if col != fallback_signal:
-                            df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
-                    for col in all_signals:
-                        if col != fallback_signal:
-                            df.loc[mask, col] = np.nan
-                    # 👇 Add here
-                    if "2: MAP" or "3: Systolic" or "4: Diastolic" in df.columns:
-                        df["2: MAP"] = df["2: MAP"].replace(0, np.nan)
-                        df["3: Systolic"] = df["3: Systolic"].replace(0, np.nan)
-                        df["4: Diastolic"] = df["4: Diastolic"].replace(0, np.nan)
-                else:
-                    st.warning("AutoCal gating column not found (e.g., '11: AutoCal Countdown'). Proceeding without AutoCal masking.")
-
-                # -------- FILTER FINGER PRESSURE BASED ON USER CHOICE --------
                 if filter_method_fp == "Jump Filter":
-                    df[main_signal] = apply_jump_filter(
-                        df[main_signal].values,
-                        df['time_s'].values,
-                        jumpval=jumpval_fp,
-                        indxval=indxval_fp
-                    )
-                else:
-                    # "No Filter": leave Finger Pressure as-is (ensure numeric dtype)
-                    df[main_signal] = pd.to_numeric(df[main_signal], errors='coerce').astype('float64')
-
-                # CBF: Handle separately if present in columns (with its own filter settings)
-                if fallback_signal in all_signals:
-                    if 'filter_method_ch18' in locals() and filter_method_ch18 == "Jump Filter":
-                        df['unfiltered_signal_Ch_18'] = df[fallback_signal].copy()
-                        df[fallback_signal] = apply_jump_filter(
-                            df[fallback_signal].values,
-                            df['time_s'].values,
-                            jumpval=jumpval_ch18,
-                            indxval=indxval_ch18
+                    jumpval_fp = st.slider(
+                        "Jump Threshold (Δ amplitude)",
+                        5, 100, 30, step=5, key="fp_jumpval",
+                        help=(
+                            "Defines how big a sudden change must be to be treated as an artifact.\n\n"
+                            "- **Lower values** → More aggressive: even small fluctuations may be removed.\n"
+                            "- **Higher values** → More tolerant: only very large jumps are removed.\n\n"
+                            "Default: 30 (balanced)."
                         )
-                        # Outlier attenuation for UNFILTERED CBF (pointwise Hampel/Winsor) — remove BIG spikes, keep normal pulsatility
-                        if 'unfiltered_signal_Ch_18' in df.columns:
+                    )
+                    indxval_fp = st.slider(
+                        "Close Jump Window (samples)",
+                        10, 1000, 500, step=10, key="fp_indxval",
+                        help=(
+                            "Defines how many samples around a detected jump are also marked invalid.\n\n"
+                            "- **Lower values** → Narrow masking (keeps more data, but may leave residual noise).\n"
+                            "- **Higher values** → Wider masking (removes more data, but ensures cleaner signal).\n\n"
+                            "Default: 500."
+                        )
+                    )
+
+        if uploaded_mat and fallback_signal in all_columns:
+            with st.expander("Cerebral Blood Flow (CBF) – Filtering Options", expanded=False):
+                st.markdown(
+                    "These settings help remove noise, sudden jumps, and spikes from the CBF signal. "
+                    "Start with the defaults unless you know the data well. "
+                    "Use the tooltips for explanation."
+                )
+
+                filter_method_ch18 = st.radio(
+                    "Choose filtering method",
+                    ["No Filter", "Jump Filter"],
+                    index=1,
+                    horizontal=True,
+                    key="ch18_filter_method",
+                    help="No Filter = raw signal. Jump Filter = removes sudden unrealistic jumps."
+                )
+
+                if filter_method_ch18 == "Jump Filter":
+                    st.subheader("Basic Settings")
+                    jumpval_ch18 = st.slider(
+                        "Jump Threshold (Δ amplitude)",
+                        5, 100, 10, step=5, key="ch18_jumpval",
+                        help=(
+                            "Defines how big a sudden change must be to be treated as an artifact.\n\n"
+                            "- **Lower values** → More aggressive: catches small jumps, may remove real variations.\n"
+                            "- **Higher values** → More tolerant: ignores small jumps, only removes extreme ones.\n\n"
+                            "Default: 10."
+                        )
+                    )
+                    indxval_ch18 = st.slider(
+                        "Close Jump Window (samples)",
+                        10, 1000, 200, step=10, key="ch18_indxval",
+                        help=(
+                            "Defines how many samples around a detected jump are also removed.\n\n"
+                            "- **Lower values** → Minimal effect area (preserves more data, may keep small noise).\n"
+                            "- **Higher values** → Larger effect area (removes more data, ensures cleaner signal).\n\n"
+                            "Default: 200."
+                        )
+                    )
+
+                    st.subheader("Advanced Outlier Control")
+                    _med_win_ch18 = st.slider(
+                        "Median Window Length (samples)",
+                        0, 1000, 200, step=10, key="_med_win_ch18",
+                        help=(
+                            "Defines the window size for smoothing the signal using a rolling median.\n\n"
+                            "- **Smaller values** → Less smoothing, keeps fine detail (but may leave noise).\n"
+                            "- **Larger values** → Stronger smoothing, removes noise (but may blur fast changes).\n\n"
+                            "Default: 200."
+                        )
+                    )
+                    _k_pos_ch18 = st.slider(
+                        "Positive Spike Threshold (MADs)",
+                        0.0, 15.0, 5.0, step=0.1, key="_k_pos_ch18",
+                        help=(
+                            "Controls removal of sudden upward spikes.\n"
+                            "Measured in Median Absolute Deviations (MADs).\n\n"
+                            "- **Lower values** → Stricter removal: even small spikes are clipped.\n"
+                            "- **Higher values** → More tolerant: only very large spikes are clipped.\n\n"
+                            "Default: 5.0."
+                        )
+                    )
+                    _k_neg_ch18 = st.slider(
+                        "Negative Spike Threshold (MADs)",
+                        0.0, 15.0, 1.5, step=0.1, key="_k_neg_ch18",
+                        help=(
+                            "Controls removal of sudden downward dips.\n"
+                            "Measured in Median Absolute Deviations (MADs).\n\n"
+                            "- **Lower values** → Stricter: clips even small dips.\n"
+                            "- **Higher values** → More tolerant: only very large dips are clipped.\n\n"
+                            "Default: 1.5."
+                        )
+                    )
+            
+        if st.button("Convert and Resample"):
+            with st.spinner("Converting and resampling... Please wait."):
+                if main_signal == priority_signal:
+                    df['unfiltered_signal'] = df[main_signal].copy()
+                    autocal_col = find_autocal_column(df)
+                    if autocal_col is not None:
+                        st.caption(f"AutoCal gating: using column **{autocal_col}** (masking logic based on Auto Calibration setting)")
+                        auto_cal_option = st.session_state.get("auto_cal_option", "Disabled")
+                        mask = None
+                        if auto_cal_option == "Enabled":
                             try:
-                                _cbf_unf = pd.to_numeric(df[fallback_signal], errors='coerce').astype('float64').to_numpy()
+                                mask = df[autocal_col].astype(float) < 0.5
                             except Exception:
-                                _cbf_unf = df[fallback_signal].to_numpy()
-
-                        df[fallback_signal] = median_filter( _med_win = _med_win_ch18,_k_pos = _k_pos_ch18,_k_neg = _k_neg_ch18,_eps = 1e-9,raw_signal=_cbf_unf)
-
+                                # Fallback for non-numeric/boolean encodings
+                                mask = (df[autocal_col] == 0) | (df[autocal_col] == False)
+                        elif auto_cal_option == "Disabled":
+                            # Mask from 'HCU not connected' comment forward until autocal_col > 0.5
+                            mask = np.zeros(len(df), dtype=bool)
+                            if df_comments is not None and not df_comments.empty:
+                                n_blocks = len(np.atleast_1d(mat["blocktimes"]))
+                                # Compute block offsets for global indexing
+                                block_lengths = []
+                                for _, row in df_channel_info.iterrows():
+                                    if row["title"] == autocal_col and row.get("datastart") is not None:
+                                        block_lengths = [int(e-s+1) for s, e in zip(row["datastart"], row["dataend"])]
+                                        break
+                                if not block_lengths:
+                                    # fallback: use length of df divided by n_blocks
+                                    block_lengths = [len(df) // n_blocks] * n_blocks
+                                block_offsets = np.cumsum([0] + block_lengths[:-1])
+                                # Find all comments with "HCU not connected"
+                                matches = df_comments[df_comments["comment_text"] == "HCU not connected"]
+                                for _, ev in matches.iterrows():
+                                    block_index = int(ev["block_index"]) - 1
+                                    sample_index = int(ev["sample_index"])
+                                    if 0 <= block_index < len(block_offsets):
+                                        idx_global = block_offsets[block_index] + sample_index
+                                        # Mask from idx_global forward until autocal_col > 0.5
+                                        for i in range(idx_global, len(df)):
+                                            try:
+                                                val = float(df[autocal_col].iloc[i])
+                                            except Exception:
+                                                val = 0.0 if (df[autocal_col].iloc[i] == 0 or df[autocal_col].iloc[i] == False) else 1.0
+                                            if val > 0.5:
+                                                break
+                                            mask[i] = True
+                        # Ensure numeric signals are float to safely receive NaNs
+                        for col in all_signals:
+                            if col != fallback_signal:
+                                df[col] = pd.to_numeric(df[col], errors='coerce').astype('float64')
+                        for col in all_signals:
+                            if col != fallback_signal:
+                                df.loc[mask, col] = np.nan
+                        # 👇 Add here
+                        if "2: MAP" or "3: Systolic" or "4: Diastolic" in df.columns:
+                            df["2: MAP"] = df["2: MAP"].replace(0, np.nan)
+                            df["3: Systolic"] = df["3: Systolic"].replace(0, np.nan)
+                            df["4: Diastolic"] = df["4: Diastolic"].replace(0, np.nan)
                     else:
-                        # "No Filter": keep CBF unchanged
-                        df['unfiltered_signal_Ch_18'] = df[fallback_signal].copy()
-                        df[fallback_signal] = pd.to_numeric(df[fallback_signal], errors='coerce').astype('float64')
+                        st.warning("AutoCal gating column not found (e.g., '11: AutoCal Countdown'). Proceeding without AutoCal masking.")
 
-                df_sorted = df.sort_values('time_s').copy()
-                t0 = df_sorted['time_s'].iloc[0]
-
-                if not beat_mode:
-                    label_to_sec = {
-                        "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
-                        "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60,
-                    }
-                    current_choice = st.session_state.get('bin_choice_label', None)
-                    selected_label = current_choice if current_choice in label_to_sec else st.session_state.get('last_time_bin_label', '1 min')
-                    bin_sec = float(label_to_sec.get(selected_label, 60))
-
-                    df_tmp = df_sorted.copy()
-                    if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any():
-                        t0 = float(df_tmp['time_s'].iloc[0])
+                    # -------- FILTER FINGER PRESSURE BASED ON USER CHOICE --------
+                    if filter_method_fp == "Jump Filter":
+                        df[main_signal] = apply_jump_filter(
+                            df[main_signal].values,
+                            df['time_s'].values,
+                            jumpval=jumpval_fp,
+                            indxval=indxval_fp
+                        )
                     else:
-                        t0 = 0.0
+                        # "No Filter": leave Finger Pressure as-is (ensure numeric dtype)
+                        df[main_signal] = pd.to_numeric(df[main_signal], errors='coerce').astype('float64')
 
-                    df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
-
-                    result_df = df_tmp.groupby('time_bin').agg(
-                        {**{c: 'mean' for c in all_signals},
-                         'absolute_time': 'first',
-                         'time_s': 'first',
-                         'time_mmss_millis': 'first',
-                         'comment': first_nonempty_comment}
-                    ).reset_index(drop=True)
-
-                    st.session_state.df = df
-                    st.session_state.result_df = result_df
-                    st.session_state.all_signals = all_signals
-                    st.session_state.beat_mode = False
-                else:
-                    # ===== 5-beat processing (dynamic HR window) =====
-                    # Determine fs0 from time_s
-                    ts = df['time_s'].values
-                    if len(ts) > 1 and np.isfinite(np.diff(ts)).any():
-                        dt = float(np.nanmedian(np.diff(ts)))
-                        fs0 = 1.0 / dt if dt > 0 else 200.0
-                    else:
-                        fs0 = 200.0
-
-                    # Use Finger Pressure (main_signal) for peaks; use HR column for dynamic window if present
-                    sig0_raw = pd.to_numeric(df[main_signal], errors='coerce').astype('float64').values
-                    # light smoothing for robust peak detection
-                    sig0_filt = rolling_median_np(sig0_raw, window=5)
-
-                    # Heart Rate is always "5: HR"
-                    if "5: HR" in df.columns:
-                        hr = pd.to_numeric(df["5: HR"], errors='coerce').astype('float64').values
-                    else:
-                        hr = np.full_like(sig0_filt, 60.0, dtype=float)
-
-                    # Smooth a COPY of HR (do not modify original column) and compute per-sample half-window (samples)
-                    hr_for_win = prepare_hr_for_window(hr.copy(), roll_win=1000)
-                    hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
-                    win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=1.3, min_samples=3)
-                    # store for plotting
-                    st.session_state.hr_for_win = hr_for_win
-
-                    # Local highs using dynamic centered window
-                    peaks = find_local_high_indices(sig0_filt, win_half)
-
-                    # --- Compute CBF-specific peaks (use CBF signal, not Finger Pressure) ---
-                    peaks_cbf = np.array([], dtype=int)
+                    # CBF: Handle separately if present in columns (with its own filter settings)
                     if fallback_signal in all_signals:
-                        cbf_raw = pd.to_numeric(df[fallback_signal], errors='coerce').astype('float64').values
-                        cbf_filt = rolling_median_np(cbf_raw, window=5)
-                        peaks_cbf = find_local_high_indices(cbf_filt, win_half)
+                        if 'filter_method_ch18' in locals() and filter_method_ch18 == "Jump Filter":
+                            df['unfiltered_signal_Ch_18'] = df[fallback_signal].copy()
+                            df[fallback_signal] = apply_jump_filter(
+                                df[fallback_signal].values,
+                                df['time_s'].values,
+                                jumpval=jumpval_ch18,
+                                indxval=indxval_ch18
+                            )
+                            # Outlier attenuation for UNFILTERED CBF (pointwise Hampel/Winsor) — remove BIG spikes, keep normal pulsatility
+                            if 'unfiltered_signal_Ch_18' in df.columns:
+                                try:
+                                    _cbf_unf = pd.to_numeric(df[fallback_signal], errors='coerce').astype('float64').to_numpy()
+                                except Exception:
+                                    _cbf_unf = df[fallback_signal].to_numpy()
 
-                    # ===== Build moving and block averages for ALL signals (including fallback) using priority-derived peaks =====
-                    signals_to_process = list(all_signals)
-                    agg5_moving_map = {}
-                    # agg5_block_map  = {}
+                            df[fallback_signal] = median_filter( _med_win = _med_win_ch18,_k_pos = _k_pos_ch18,_k_neg = _k_neg_ch18,_eps = 1e-9,raw_signal=_cbf_unf)
 
-                    # Precompute moving window segment boundaries from peaks (independent of signal)
-                    N = len(sig0_filt)
-                    if peaks.size >= beats_k:
-                        W = peaks.size - (beats_k - 1)
-                        # centers at the middle peak of each K-beat window
-                        centers_idx = np.array([peaks[w + (beats_k // 2)] for w in range(W)], dtype=int)
-                        # midpoints between centers define segment edges
-                        if W > 1:
-                            mids = np.rint((centers_idx[:-1] + centers_idx[1:]) / 2.0).astype(int)
                         else:
-                            mids = np.array([], dtype=int)
-                        seg_starts_template = np.empty(W, dtype=int)
-                        seg_ends_template   = np.empty(W, dtype=int)
-                        for w in range(W):
-                            seg_starts_template[w] = 0 if w == 0 else int(mids[w-1])
-                            seg_ends_template[w]   = N if w == W - 1 else int(mids[w])
+                            # "No Filter": keep CBF unchanged
+                            df['unfiltered_signal_Ch_18'] = df[fallback_signal].copy()
+                            df[fallback_signal] = pd.to_numeric(df[fallback_signal], errors='coerce').astype('float64')
+
+                    df_sorted = df.sort_values('time_s').copy()
+                    t0 = df_sorted['time_s'].iloc[0]
+
+                    if not beat_mode:
+                        label_to_sec = {
+                            "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
+                            "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60,
+                        }
+                        current_choice = st.session_state.get('bin_choice_label', None)
+                        selected_label = current_choice if current_choice in label_to_sec else st.session_state.get('last_time_bin_label', '1 min')
+                        bin_sec = float(label_to_sec.get(selected_label, 60))
+
+                        df_tmp = df_sorted.copy()
+                        if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any():
+                            t0 = float(df_tmp['time_s'].iloc[0])
+                        else:
+                            t0 = 0.0
+
+                        df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
+
+                        result_df = df_tmp.groupby('time_bin').agg(
+                            {**{c: 'mean' for c in all_signals},
+                             'absolute_time': 'first',
+                             'time_s': 'first',
+                             'time_mmss_millis': 'first',
+                             'comment': first_nonempty_comment}
+                        ).reset_index(drop=True)
+
+                        st.session_state.df = df
+                        st.session_state.result_df = result_df
+                        st.session_state.all_signals = all_signals
+                        st.session_state.beat_mode = False
                     else:
-                        W = 0
-
-                    # Comment mask once (shared for all signals)
-                    is_comment = df['comment'].fillna('').astype(str).values != ''
-
-                    for sig_name in signals_to_process:
-                        y = pd.to_numeric(df[sig_name], errors='coerce').astype('float64').values
-                        Nsig = len(y)
-
-                        # Choose which peaks to use: CBF uses its own peaks; others use Finger Pressure peaks
-                        if (sig_name == fallback_signal) and ('peaks_cbf' in locals()) and (peaks_cbf.size > 0):
-                            peaks_used = peaks_cbf
+                        # ===== 5-beat processing (dynamic HR window) =====
+                        # Determine fs0 from time_s
+                        ts = df['time_s'].values
+                        if len(ts) > 1 and np.isfinite(np.diff(ts)).any():
+                            dt = float(np.nanmedian(np.diff(ts)))
+                            fs0 = 1.0 / dt if dt > 0 else 200.0
                         else:
-                            peaks_used = peaks
+                            fs0 = 200.0
 
-                        # --- Moving (overlapping) K-peak mean (CENTERED: mean around current beat) ---
-                        agg_m = np.full(Nsig, np.nan, dtype=float)
-                        if peaks_used.size >= beats_k:
-                            nP = peaks_used.size
-                            mids_used = np.rint((peaks_used[:-1] + peaks_used[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
+                        # Use Finger Pressure (main_signal) for peaks; use HR column for dynamic window if present
+                        sig0_raw = pd.to_numeric(df[main_signal], errors='coerce').astype('float64').values
+                        # light smoothing for robust peak detection
+                        sig0_filt = rolling_median_np(sig0_raw, window=5)
+
+                        # Heart Rate is always "5: HR"
+                        if "5: HR" in df.columns:
+                            hr = pd.to_numeric(df["5: HR"], errors='coerce').astype('float64').values
+                        else:
+                            hr = np.full_like(sig0_filt, 60.0, dtype=float)
+
+                        # Smooth a COPY of HR (do not modify original column) and compute per-sample half-window (samples)
+                        hr_for_win = prepare_hr_for_window(hr.copy(), roll_win=1000)
+                        hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
+                        win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=1.3, min_samples=3)
+                        # store for plotting
+                        st.session_state.hr_for_win = hr_for_win
+
+                        # Local highs using dynamic centered window
+                        peaks = find_local_high_indices(sig0_filt, win_half)
+
+                        # --- Compute CBF-specific peaks (use CBF signal, not Finger Pressure) ---
+                        peaks_cbf = np.array([], dtype=int)
+                        if fallback_signal in all_signals:
+                            cbf_raw = pd.to_numeric(df[fallback_signal], errors='coerce').astype('float64').values
+                            cbf_filt = rolling_median_np(cbf_raw, window=5)
+                            peaks_cbf = find_local_high_indices(cbf_filt, win_half)
+
+                        # ===== Build moving and block averages for ALL signals (including fallback) using priority-derived peaks =====
+                        signals_to_process = list(all_signals)
+                        agg5_moving_map = {}
+                        # agg5_block_map  = {}
+
+                        # Precompute moving window segment boundaries from peaks (independent of signal)
+                        N = len(sig0_filt)
+                        if peaks.size >= beats_k:
+                            W = peaks.size - (beats_k - 1)
+                            # centers at the middle peak of each K-beat window
+                            centers_idx = np.array([peaks[w + (beats_k // 2)] for w in range(W)], dtype=int)
+                            # midpoints between centers define segment edges
+                            if W > 1:
+                                mids = np.rint((centers_idx[:-1] + centers_idx[1:]) / 2.0).astype(int)
+                            else:
+                                mids = np.array([], dtype=int)
+                            seg_starts_template = np.empty(W, dtype=int)
+                            seg_ends_template   = np.empty(W, dtype=int)
+                            for w in range(W):
+                                seg_starts_template[w] = 0 if w == 0 else int(mids[w-1])
+                                seg_ends_template[w]   = N if w == W - 1 else int(mids[w])
+                        else:
+                            W = 0
+
+                        # Comment mask once (shared for all signals)
+                        is_comment = df['comment'].fillna('').astype(str).values != ''
+
+                        for sig_name in signals_to_process:
+                            y = pd.to_numeric(df[sig_name], errors='coerce').astype('float64').values
+                            Nsig = len(y)
+
+                            # Choose which peaks to use: CBF uses its own peaks; others use Finger Pressure peaks
+                            if (sig_name == fallback_signal) and ('peaks_cbf' in locals()) and (peaks_cbf.size > 0):
+                                peaks_used = peaks_cbf
+                            else:
+                                peaks_used = peaks
+
+                            # --- Moving (overlapping) K-peak mean (CENTERED: mean around current beat) ---
+                            agg_m = np.full(Nsig, np.nan, dtype=float)
+                            if peaks_used.size >= beats_k:
+                                nP = peaks_used.size
+                                mids_used = np.rint((peaks_used[:-1] + peaks_used[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
+                                half_k = beats_k // 2
+                                for i in range(half_k, nP - (beats_k - half_k - 1)):
+                                    # centered mean from beat i-half_k to i+half_k
+                                    i0 = peaks_used[i - half_k]
+                                    i1 = peaks_used[i + (beats_k - half_k - 1)]
+                                    if i1 < i0:
+                                        i0, i1 = i1, i0
+                                    mval = float(np.nanmean(y[i0:i1+1]))
+                                    # assign from midpoint(prev,current) to midpoint(current,next)
+                                    seg_start = 0 if i == 0 else int(mids_used[i - 1]) if i - 1 < len(mids_used) else 0
+                                    seg_end = Nsig if i == (nP - 1) else int(mids_used[i]) if i < len(mids_used) else Nsig
+                                    s = max(0, seg_start)
+                                    e = min(Nsig, seg_end)
+                                    if e > s:
+                                        agg_m[s:e] = mval
+
+                            # --- Block (non-overlapping, CONTINUOUS, comment-aware reset, up to K beats) ---
+                            agg_b = np.full(Nsig, np.nan, dtype=float)
+                            if peaks_used.size >= 1:
+                                current_first = peaks_used[0]
+                                beats_in_block = 1
+                                prev_peak = peaks_used[0]
+                                for pk in peaks_used[1:]:
+                                    beats_in_block += 1
+                                    if is_comment[prev_peak:pk+1].any() or beats_in_block == beats_k:
+                                        close_at = pk
+                                        i0, i1 = (current_first, close_at) if current_first <= close_at else (close_at, current_first)
+                                        block_mean = float(np.nanmean(y[i0:i1+1]))
+                                        assign_start = min(current_first, close_at)
+                                        assign_end = max(current_first, close_at)
+                                        agg_b[assign_start:assign_end] = block_mean
+                                        current_first = close_at
+                                        beats_in_block = 1
+                                    prev_peak = pk
+                                # close final block to end
+                                i0, i1 = (current_first, prev_peak) if current_first <= prev_peak else (prev_peak, current_first)
+                                final_mean = float(np.nanmean(y[i0:i1+1]))
+                                agg_b[min(i0, i1):Nsig] = final_mean
+
+                            agg5_moving_map[sig_name] = agg_m
+                            # agg5_block_map[sig_name]  = agg_b
+
+                        # Also compute/store for the priority signal itself
+                        y0 = sig0_filt
+                        agg_m = np.full(N, np.nan, dtype=float)
+                        if peaks.size >= beats_k:
+                            nP = peaks.size
+                            mids = np.rint((peaks[:-1] + peaks[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
                             half_k = beats_k // 2
                             for i in range(half_k, nP - (beats_k - half_k - 1)):
-                                # centered mean from beat i-half_k to i+half_k
-                                i0 = peaks_used[i - half_k]
-                                i1 = peaks_used[i + (beats_k - half_k - 1)]
+                                i0 = peaks[i - half_k]
+                                i1 = peaks[i + (beats_k - half_k - 1)]
                                 if i1 < i0:
                                     i0, i1 = i1, i0
-                                mval = float(np.nanmean(y[i0:i1+1]))
-                                # assign from midpoint(prev,current) to midpoint(current,next)
-                                seg_start = 0 if i == 0 else int(mids_used[i - 1]) if i - 1 < len(mids_used) else 0
-                                seg_end = Nsig if i == (nP - 1) else int(mids_used[i]) if i < len(mids_used) else Nsig
+                                mval = float(np.nanmean(y0[i0:i1+1]))
+                                seg_start = 0 if i == 0 else int(mids[i - 1]) if i - 1 < len(mids) else 0
+                                seg_end = N if i == (nP - 1) else int(mids[i]) if i < len(mids) else N
                                 s = max(0, seg_start)
-                                e = min(Nsig, seg_end)
+                                e = min(N, seg_end)
                                 if e > s:
                                     agg_m[s:e] = mval
-
-                        # --- Block (non-overlapping, CONTINUOUS, comment-aware reset, up to K beats) ---
-                        agg_b = np.full(Nsig, np.nan, dtype=float)
-                        if peaks_used.size >= 1:
-                            current_first = peaks_used[0]
+                        agg_b = np.full(N, np.nan, dtype=float)
+                        if peaks.size >= 1:
+                            current_first = peaks[0]
                             beats_in_block = 1
-                            prev_peak = peaks_used[0]
-                            for pk in peaks_used[1:]:
+                            prev_peak = peaks[0]
+                            for pk in peaks[1:]:
                                 beats_in_block += 1
                                 if is_comment[prev_peak:pk+1].any() or beats_in_block == beats_k:
                                     close_at = pk
                                     i0, i1 = (current_first, close_at) if current_first <= close_at else (close_at, current_first)
-                                    block_mean = float(np.nanmean(y[i0:i1+1]))
+                                    block_mean = float(np.nanmean(y0[i0:i1+1]))
                                     assign_start = min(current_first, close_at)
                                     assign_end = max(current_first, close_at)
                                     agg_b[assign_start:assign_end] = block_mean
                                     current_first = close_at
                                     beats_in_block = 1
                                 prev_peak = pk
-                            # close final block to end
                             i0, i1 = (current_first, prev_peak) if current_first <= prev_peak else (prev_peak, current_first)
-                            final_mean = float(np.nanmean(y[i0:i1+1]))
-                            agg_b[min(i0, i1):Nsig] = final_mean
+                            final_mean = float(np.nanmean(y0[i0:i1+1]))
+                            agg_b[min(i0, i1):N] = final_mean
 
-                        agg5_moving_map[sig_name] = agg_m
-                        # agg5_block_map[sig_name]  = agg_b
+                        agg5_moving_map[main_signal] = agg_m
+                        # agg5_block_map[main_signal]  = agg_b
 
-                    # Also compute/store for the priority signal itself
-                    y0 = sig0_filt
-                    agg_m = np.full(N, np.nan, dtype=float)
-                    if peaks.size >= beats_k:
-                        nP = peaks.size
-                        mids = np.rint((peaks[:-1] + peaks[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
-                        half_k = beats_k // 2
-                        for i in range(half_k, nP - (beats_k - half_k - 1)):
-                            i0 = peaks[i - half_k]
-                            i1 = peaks[i + (beats_k - half_k - 1)]
-                            if i1 < i0:
-                                i0, i1 = i1, i0
-                            mval = float(np.nanmean(y0[i0:i1+1]))
-                            seg_start = 0 if i == 0 else int(mids[i - 1]) if i - 1 < len(mids) else 0
-                            seg_end = N if i == (nP - 1) else int(mids[i]) if i < len(mids) else N
-                            s = max(0, seg_start)
-                            e = min(N, seg_end)
-                            if e > s:
-                                agg_m[s:e] = mval
-                    agg_b = np.full(N, np.nan, dtype=float)
-                    if peaks.size >= 1:
-                        current_first = peaks[0]
-                        beats_in_block = 1
-                        prev_peak = peaks[0]
-                        for pk in peaks[1:]:
-                            beats_in_block += 1
-                            if is_comment[prev_peak:pk+1].any() or beats_in_block == beats_k:
-                                close_at = pk
-                                i0, i1 = (current_first, close_at) if current_first <= close_at else (close_at, current_first)
-                                block_mean = float(np.nanmean(y0[i0:i1+1]))
-                                assign_start = min(current_first, close_at)
-                                assign_end = max(current_first, close_at)
-                                agg_b[assign_start:assign_end] = block_mean
-                                current_first = close_at
-                                beats_in_block = 1
-                            prev_peak = pk
-                        i0, i1 = (current_first, prev_peak) if current_first <= prev_peak else (prev_peak, current_first)
-                        final_mean = float(np.nanmean(y0[i0:i1+1]))
-                        agg_b[min(i0, i1):N] = final_mean
+                        # Store to session
+                        st.session_state.df = df
+                        st.session_state.all_signals = all_signals
+                        st.session_state.beat_mode = True
+                        st.session_state.beats_k = beats_k
+                        st.session_state.beat_signal_name = main_signal
+                        st.session_state.agg5_moving_map = agg5_moving_map
+                        # st.session_state.agg5_block_map = agg5_block_map
+                        st.session_state.sig0_filt = sig0_filt
+                        st.session_state.peaks_idx = peaks
+                        if 'peaks_cbf' in locals():
+                            st.session_state.peaks_idx_cbf = peaks_cbf
 
-                    agg5_moving_map[main_signal] = agg_m
-                    # agg5_block_map[main_signal]  = agg_b
+                elif main_signal == fallback_signal:
+                    # CBF
+                    if filter_method_ch18 == "Jump Filter":
+                        filtered_signal = apply_jump_filter(
+                            df[main_signal].values,
+                            df['time_s'].values,
+                            jumpval=jumpval_ch18,
+                            indxval=indxval_ch18
+                        )
+                    else:
+                        # "No Filter": keep unchanged
+                        filtered_signal = pd.to_numeric(df[main_signal], errors='coerce').astype('float64').values
 
-                    # Store to session
-                    st.session_state.df = df
-                    st.session_state.all_signals = all_signals
-                    st.session_state.beat_mode = True
-                    st.session_state.beats_k = beats_k
-                    st.session_state.beat_signal_name = main_signal
-                    st.session_state.agg5_moving_map = agg5_moving_map
-                    # st.session_state.agg5_block_map = agg5_block_map
-                    st.session_state.sig0_filt = sig0_filt
-                    st.session_state.peaks_idx = peaks
-                    if 'peaks_cbf' in locals():
-                        st.session_state.peaks_idx_cbf = peaks_cbf
+                    df['unfiltered_signal_Ch_18'] = df[main_signal].copy()
+                    df[main_signal] = pd.to_numeric(df[main_signal], errors='coerce').astype('float64')
+                    df[main_signal] = filtered_signal
 
-            elif main_signal == fallback_signal:
-                # CBF
-                if filter_method_ch18 == "Jump Filter":
-                    filtered_signal = apply_jump_filter(
-                        df[main_signal].values,
-                        df['time_s'].values,
-                        jumpval=jumpval_ch18,
-                        indxval=indxval_ch18
-                    )
+                    df_sorted = df.sort_values('time_s').copy()
+                    t0 = df_sorted['time_s'].iloc[0]
+
+                    if not beat_mode:
+                        label_to_sec = {
+                            "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
+                            "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60,
+                        }
+                        current_choice = st.session_state.get('bin_choice_label', None)
+                        selected_label = current_choice if current_choice in label_to_sec else st.session_state.get('last_time_bin_label', '1 min')
+                        bin_sec = float(label_to_sec.get(selected_label, 60))
+
+                        df_tmp = df_sorted.copy()
+                        if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any():
+                            t0 = float(df_tmp['time_s'].iloc[0])
+                        else:
+                            t0 = 0.0
+
+                        df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
+
+                        result_df = df_tmp.groupby('time_bin').agg(
+                            {**{main_signal: 'mean'},
+                             'absolute_time': 'first',
+                             'time_s': 'first',
+                             'time_mmss_millis': 'first',
+                             'comment': first_nonempty_comment}
+                        ).reset_index(drop=True)
+
+                        st.session_state.df = df
+                        st.session_state.result_df = result_df
+                        st.session_state.all_signals = [main_signal]
+                        st.session_state.beat_mode = False
+                    else:
+                        # ===== 5-beat processing (dynamic HR window) for CBF as analyzed signal =====
+                        ts = df['time_s'].values
+                        if len(ts) > 1 and np.isfinite(np.diff(ts)).any():
+                            dt = float(np.nanmedian(np.diff(ts)))
+                            fs0 = 1.0 / dt if dt > 0 else 200.0
+                        else:
+                            fs0 = 200.0
+
+                        sig0_raw = pd.to_numeric(df[main_signal], errors='coerce').astype('float64').values
+                        sig0_filt = rolling_median_np(sig0_raw, window=5)
+
+                        # Heart Rate is always "5: HR"
+                        if "5: HR" in df.columns:
+                            hr = pd.to_numeric(df["5: HR"], errors='coerce').astype('float64').values
+                        else:
+                            # Fallback if column truly missing
+                            hr = np.full_like(sig0_filt, 60.0, dtype=float)
+
+                        # Smooth a COPY of HR (do not modify original column) and compute per-sample half-window (samples)
+                        hr_for_win = prepare_hr_for_window(hr.copy(), roll_win=1000)
+                        hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
+                        win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=2.0, min_samples=3)
+                        # store for plotting
+                        st.session_state.hr_for_win = hr_for_win
+
+                        peaks = find_local_high_indices(sig0_filt, win_half)
+
+                        agg5_moving = np.full(len(sig0_filt), np.nan, dtype=float)
+                        if peaks.size >= beats_k:
+                            nP = peaks.size
+                            mids = np.rint((peaks[:-1] + peaks[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
+                            half_k = beats_k // 2
+                            for i in range(half_k, nP - (beats_k - half_k - 1)):
+                                i0 = peaks[i - half_k]
+                                i1 = peaks[i + (beats_k - half_k - 1)]
+                                if i1 < i0:
+                                    i0, i1 = i1, i0
+                                mval = float(np.nanmean(sig0_filt[i0:i1+1]))
+                                seg_start = 0 if i == 0 else int(mids[i - 1]) if i - 1 < len(mids) else 0
+                                seg_end = len(sig0_filt) if i == (nP - 1) else int(mids[i]) if i < len(mids) else len(sig0_filt)
+                                s = max(0, seg_start)
+                                e = min(len(sig0_filt), seg_end)
+                                if e > s:
+                                    agg5_moving[s:e] = mval
+
+                        # Build block K-beat average (non-overlapping, CONTINUOUS, comment-aware reset)
+                        agg5_block = np.full(len(sig0_filt), np.nan, dtype=float)
+                        if peaks.size >= 1:
+                            is_comment = df['comment'].fillna('').astype(str).values != ''
+                            current_first = peaks[0]
+                            beats_in_block = 1
+                            prev_peak = peaks[0]
+                            for pk in peaks[1:]:
+                                beats_in_block += 1
+                                if is_comment[prev_peak:pk+1].any() or beats_in_block == beats_k:
+                                    close_at = pk
+                                    i0, i1 = (current_first, close_at) if current_first <= close_at else (close_at, current_first)
+                                    block_mean = float(np.nanmean(sig0_filt[i0:i1+1]))
+                                    assign_start = min(current_first, close_at)
+                                    assign_end = max(current_first, close_at)
+                                    agg5_block[assign_start:assign_end] = block_mean
+                                    current_first = close_at
+                                    beats_in_block = 1
+                                prev_peak = pk
+                            i0, i1 = (current_first, prev_peak) if current_first <= prev_peak else (prev_peak, current_first)
+                            final_mean = float(np.nanmean(sig0_filt[i0:i1+1]))
+                            agg5_block[min(i0, i1):len(sig0_filt)] = final_mean
+
+                        st.session_state.df = df
+                        st.session_state.all_signals = [main_signal]
+                        st.session_state.beat_mode = True
+                        st.session_state.beats_k = beats_k
+                        st.session_state.beat_signal_name = main_signal
+                        st.session_state.agg5_moving = agg5_moving
+                        st.session_state.agg5_block = agg5_block
+                        st.session_state.sig0_filt = sig0_filt
+                        st.session_state.peaks_idx = peaks
+
+    # === Visualization Phase (runs even after convert)
+    if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.session_state.beat_mode):
+        df = st.session_state.df
+        all_signals = st.session_state.all_signals
+        beat_mode = st.session_state.get('beat_mode', False)
+        result_df = st.session_state.get('result_df', None)
+
+        # Select which signal to operate on (needed before CSV export below)
+        plot_signal = st.selectbox("Select Signal to Plot", all_signals, index=0, key="plot_signal_select")
+
+        # Fetch beats_k for labeling
+        beats_k = st.session_state.get('beats_k', 5)
+        # Keep selected bin label for export sheet naming
+        st.session_state['selected_bin_label'] = st.session_state.get('selected_bin_label', None)
+        try:
+            # Prefer the original UI choice if available in state
+            if 'fp_filter_method' in st.session_state:
+                # Best-effort: recover label from earlier selection block
+                st.session_state['selected_bin_label'] = st.session_state.get('selected_bin_label', st.session_state.get('bin_choice_label', None))
+        except Exception:
+            pass
+
+        file_base = uploaded_mat.name.split('.')[0]
+
+
+
+        beat_mode = st.session_state.get('beat_mode', False)
+        fig = go.Figure()
+
+        # # Plot smoothed HR used for window sizing (if available)
+        # hr_plot = st.session_state.get('hr_for_win', None)
+        # if hr_plot is not None:
+        #     fig.add_trace(go.Scatter(
+        #         x=df['time_s'], y=hr_plot, mode='lines', name='HR for window (smoothed)',
+        #         yaxis='y2', line=dict(width=1)
+        #     ))
+
+        # === Add stats view toggle ===
+        show_stats_view = st.checkbox("Enable Stats View (hide other lines)", value=False)
+
+        # Only show Raw and Filtered traces if stats view is disabled
+        if not show_stats_view:
+            if plot_signal == fallback_signal:
+                fig.add_trace(go.Scatter(
+                    x=df['time_s'], y=df['unfiltered_signal_Ch_18'], mode='lines', name='Raw (unfiltered)',
+                    line=dict(color='rgba(200,200,200,0.5)', width=1)
+                ))
+            elif plot_signal in ['1: Finger Pressure', '2: MAP', '3: Systolic', '4: Diastolic']:
+                if plot_signal == '1: Finger Pressure':
+                    raw_name = "Raw (unfiltered)"
                 else:
-                    # "No Filter": keep unchanged
-                    filtered_signal = pd.to_numeric(df[main_signal], errors='coerce').astype('float64').values
-
-                df['unfiltered_signal_Ch_18'] = df[main_signal].copy()
-                df[main_signal] = pd.to_numeric(df[main_signal], errors='coerce').astype('float64')
-                df[main_signal] = filtered_signal
-
-                df_sorted = df.sort_values('time_s').copy()
-                t0 = df_sorted['time_s'].iloc[0]
-
-                if not beat_mode:
-                    label_to_sec = {
-                        "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
-                        "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60,
-                    }
-                    current_choice = st.session_state.get('bin_choice_label', None)
-                    selected_label = current_choice if current_choice in label_to_sec else st.session_state.get('last_time_bin_label', '1 min')
-                    bin_sec = float(label_to_sec.get(selected_label, 60))
-
-                    df_tmp = df_sorted.copy()
-                    if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any():
-                        t0 = float(df_tmp['time_s'].iloc[0])
-                    else:
-                        t0 = 0.0
-
-                    df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
-
-                    result_df = df_tmp.groupby('time_bin').agg(
-                        {**{main_signal: 'mean'},
-                         'absolute_time': 'first',
-                         'time_s': 'first',
-                         'time_mmss_millis': 'first',
-                         'comment': first_nonempty_comment}
-                    ).reset_index(drop=True)
-
-                    st.session_state.df = df
-                    st.session_state.result_df = result_df
-                    st.session_state.all_signals = [main_signal]
-                    st.session_state.beat_mode = False
-                else:
-                    # ===== 5-beat processing (dynamic HR window) for CBF as analyzed signal =====
-                    ts = df['time_s'].values
-                    if len(ts) > 1 and np.isfinite(np.diff(ts)).any():
-                        dt = float(np.nanmedian(np.diff(ts)))
-                        fs0 = 1.0 / dt if dt > 0 else 200.0
-                    else:
-                        fs0 = 200.0
-
-                    sig0_raw = pd.to_numeric(df[main_signal], errors='coerce').astype('float64').values
-                    sig0_filt = rolling_median_np(sig0_raw, window=5)
-
-                    # Heart Rate is always "5: HR"
-                    if "5: HR" in df.columns:
-                        hr = pd.to_numeric(df["5: HR"], errors='coerce').astype('float64').values
-                    else:
-                        # Fallback if column truly missing
-                        hr = np.full_like(sig0_filt, 60.0, dtype=float)
-
-                    # Smooth a COPY of HR (do not modify original column) and compute per-sample half-window (samples)
-                    hr_for_win = prepare_hr_for_window(hr.copy(), roll_win=1000)
-                    hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
-                    win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=2.0, min_samples=3)
-                    # store for plotting
-                    st.session_state.hr_for_win = hr_for_win
-
-                    peaks = find_local_high_indices(sig0_filt, win_half)
-
-                    agg5_moving = np.full(len(sig0_filt), np.nan, dtype=float)
-                    if peaks.size >= beats_k:
-                        nP = peaks.size
-                        mids = np.rint((peaks[:-1] + peaks[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
-                        half_k = beats_k // 2
-                        for i in range(half_k, nP - (beats_k - half_k - 1)):
-                            i0 = peaks[i - half_k]
-                            i1 = peaks[i + (beats_k - half_k - 1)]
-                            if i1 < i0:
-                                i0, i1 = i1, i0
-                            mval = float(np.nanmean(sig0_filt[i0:i1+1]))
-                            seg_start = 0 if i == 0 else int(mids[i - 1]) if i - 1 < len(mids) else 0
-                            seg_end = len(sig0_filt) if i == (nP - 1) else int(mids[i]) if i < len(mids) else len(sig0_filt)
-                            s = max(0, seg_start)
-                            e = min(len(sig0_filt), seg_end)
-                            if e > s:
-                                agg5_moving[s:e] = mval
-
-                    # Build block K-beat average (non-overlapping, CONTINUOUS, comment-aware reset)
-                    agg5_block = np.full(len(sig0_filt), np.nan, dtype=float)
-                    if peaks.size >= 1:
-                        is_comment = df['comment'].fillna('').astype(str).values != ''
-                        current_first = peaks[0]
-                        beats_in_block = 1
-                        prev_peak = peaks[0]
-                        for pk in peaks[1:]:
-                            beats_in_block += 1
-                            if is_comment[prev_peak:pk+1].any() or beats_in_block == beats_k:
-                                close_at = pk
-                                i0, i1 = (current_first, close_at) if current_first <= close_at else (close_at, current_first)
-                                block_mean = float(np.nanmean(sig0_filt[i0:i1+1]))
-                                assign_start = min(current_first, close_at)
-                                assign_end = max(current_first, close_at)
-                                agg5_block[assign_start:assign_end] = block_mean
-                                current_first = close_at
-                                beats_in_block = 1
-                            prev_peak = pk
-                        i0, i1 = (current_first, prev_peak) if current_first <= prev_peak else (prev_peak, current_first)
-                        final_mean = float(np.nanmean(sig0_filt[i0:i1+1]))
-                        agg5_block[min(i0, i1):len(sig0_filt)] = final_mean
-
-                    st.session_state.df = df
-                    st.session_state.all_signals = [main_signal]
-                    st.session_state.beat_mode = True
-                    st.session_state.beats_k = beats_k
-                    st.session_state.beat_signal_name = main_signal
-                    st.session_state.agg5_moving = agg5_moving
-                    st.session_state.agg5_block = agg5_block
-                    st.session_state.sig0_filt = sig0_filt
-                    st.session_state.peaks_idx = peaks
-
-# === Visualization Phase (runs even after convert)
-if ('result_df' in st.session_state) or ('beat_mode' in st.session_state and st.session_state.beat_mode):
-    df = st.session_state.df
-    all_signals = st.session_state.all_signals
-    beat_mode = st.session_state.get('beat_mode', False)
-    result_df = st.session_state.get('result_df', None)
-
-    # Select which signal to operate on (needed before CSV export below)
-    plot_signal = st.selectbox("Select Signal to Plot", all_signals, index=0, key="plot_signal_select")
-
-    # Fetch beats_k for labeling
-    beats_k = st.session_state.get('beats_k', 5)
-    # Keep selected bin label for export sheet naming
-    st.session_state['selected_bin_label'] = st.session_state.get('selected_bin_label', None)
-    try:
-        # Prefer the original UI choice if available in state
-        if 'fp_filter_method' in st.session_state:
-            # Best-effort: recover label from earlier selection block
-            st.session_state['selected_bin_label'] = st.session_state.get('selected_bin_label', st.session_state.get('bin_choice_label', None))
-    except Exception:
-        pass
-
-    file_base = uploaded_mat.name.split('.')[0]
-
-
-
-    beat_mode = st.session_state.get('beat_mode', False)
-    fig = go.Figure()
-
-    # # Plot smoothed HR used for window sizing (if available)
-    # hr_plot = st.session_state.get('hr_for_win', None)
-    # if hr_plot is not None:
-    #     fig.add_trace(go.Scatter(
-    #         x=df['time_s'], y=hr_plot, mode='lines', name='HR for window (smoothed)',
-    #         yaxis='y2', line=dict(width=1)
-    #     ))
-
-    # === Add stats view toggle ===
-    show_stats_view = st.checkbox("Enable Stats View (hide other lines)", value=False)
-
-    # Only show Raw and Filtered traces if stats view is disabled
-    if not show_stats_view:
-        if plot_signal == fallback_signal:
+                    raw_name = "Raw (Finger Pressure)"
+                fig.add_trace(go.Scatter(
+                    x=df['time_s'], y=df['unfiltered_signal'], mode='lines', name=raw_name,
+                    line=dict(color='rgba(200,200,200,0.5)', width=1)
+                ))
             fig.add_trace(go.Scatter(
-                x=df['time_s'], y=df['unfiltered_signal_Ch_18'], mode='lines', name='Raw (unfiltered)',
-                line=dict(color='rgba(200,200,200,0.5)', width=1)
-            ))
-        elif plot_signal in ['1: Finger Pressure', '2: MAP', '3: Systolic', '4: Diastolic']:
-            if plot_signal == '1: Finger Pressure':
-                raw_name = "Raw (unfiltered)"
-            else:
-                raw_name = "Raw (Finger Pressure)"
-            fig.add_trace(go.Scatter(
-                x=df['time_s'], y=df['unfiltered_signal'], mode='lines', name=raw_name,
-                line=dict(color='rgba(200,200,200,0.5)', width=1)
-            ))
-        fig.add_trace(go.Scatter(
-            x=df['time_s'], y=df[plot_signal], mode='lines', name='Filtered',
-            line=dict(color='cyan', width=1,),
-            hovertemplate="Time: %{customdata}<br>Value: %{y}<extra></extra>",
-            customdata=df['time_s'].apply(sec_to_mmss_millis)
-        ))
-    else:
-        # --- Stats view: show moving mean, but add other lines as legendonly ---
-        # Add moving mean line (same as in non-stats view, but always shown)
-        series_m = None
-        times = None
-        if beat_mode:
-            agg5_moving_map = st.session_state.get('agg5_moving_map', {})
-            series_m = agg5_moving_map.get(plot_signal, None)
-            times = df['time_s'].values
-        elif result_df is not None and plot_signal in result_df.columns:
-            series_m = result_df[plot_signal].values
-            times = result_df['time_s'].values
-        if series_m is not None:
-            fig.add_trace(go.Scatter(
-                x=df['time_s'], y=series_m, mode='lines', name='Moving Mean',
-                line=dict(color='orange', width=3)
-            ))
-        # Add Raw and Filtered lines, but set visible='legendonly'
-        # Raw
-        if plot_signal == fallback_signal:
-            fig.add_trace(go.Scatter(
-                x=df['time_s'], y=df['unfiltered_signal_Ch_18'], mode='lines', name='Raw (unfiltered)',
-                line=dict(color='rgba(200,200,200,0.5)', width=1),
-                visible='legendonly'
-            ))
-        elif plot_signal in ['1: Finger Pressure', '2: MAP', '3: Systolic', '4: Diastolic']:
-            if plot_signal == '1: Finger Pressure':
-                raw_name = "Raw (unfiltered)"
-            else:
-                raw_name = "Raw (Finger Pressure)"
-            fig.add_trace(go.Scatter(
-                x=df['time_s'], y=df['unfiltered_signal'], mode='lines', name=raw_name,
-                line=dict(color='rgba(200,200,200,0.5)', width=1),
-                visible='legendonly'
-            ))
-        # Filtered
-        fig.add_trace(go.Scatter(
-            x=df['time_s'], y=df[plot_signal], mode='lines', name='Filtered',
-            line=dict(color='cyan', width=1,),
-            hovertemplate="Time: %{customdata}<br>Value: %{y}<extra></extra>",
-            customdata=df['time_s'].apply(sec_to_mmss_millis),
-            visible='legendonly'
-        ))
-        # Local Highs markers, legendonly
-        # Choose correct peaks for markers: CBF uses its own peaks
-        if plot_signal == fallback_signal:
-            peaks_idx = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
-        else:
-            peaks_idx = st.session_state.get('peaks_idx', np.array([], dtype=int))
-        if peaks_idx.size > 0 and plot_signal in ['1: Finger Pressure', '6: CBF']:
-            fig.add_trace(go.Scatter(
-                x=df['time_s'].iloc[peaks_idx],
-                y=df[plot_signal].iloc[peaks_idx],
-                mode='markers',
-                name='Local Highs',
-                marker=dict(size=6, color='orange', symbol='circle-open'),
-                visible='legendonly'
-            ))
-
-    # === Add horizontal mean lines and peak markers for "Standing" comments if plotting Finger Pressure or CBF ===
-    if show_stats_view:
-        if plot_signal in ['1: Finger Pressure', '6: CBF']:
-            
-            # Find all comment rows containing "Standing"
-            standing_comments = df[df['comment'].astype(str).str.strip() == "Standing"]
-            baseline_window = st.number_input("Baseline window (seconds)", min_value=10, max_value=600, value=120, step=10, help="Represents the time window for computing the baseline mean. The window ends at the moment the 'Standing' comment is made.")
-
-
-            # ---- Fixed-window parameter (defined once to avoid Streamlit duplicate IDs) ----
-            analysis_window_sec = st.number_input(
-                "Analysis window after Standing (seconds)",
-                min_value=1,
-                max_value=30,
-                value=10,
-                step=1,
-                key="fixed_window_after_standing_sec"
-            )
-
-            # ---- Area computation option ----
-            only_below_start = st.checkbox(
-                "Compute area only below Standing value",
-                value=True,
-                help="If enabled, only deviations below the Standing start value are shaded and integrated."
-            )
-
-            use_baseline_as_ref = st.checkbox(
-                "Use baseline mean as reference (instead of Vstart)",
-                value=False,
-                help="If enabled, baseline mean before Standing is used as the reference for drop and area computations."
-            )
-
-            for _, row_stand in standing_comments.iterrows():
-                comment_time = row_stand['time_s']
-
-                # --- red Line 1: mean before Standing ---
-                mask_red_pre = (times >= comment_time - baseline_window) & (times <= comment_time)
-                mean_val_red_pre = np.nanmean(series_m[mask_red_pre]) if series_m is not None else np.nan
-                if np.isfinite(mean_val_red_pre):
-                    fig.add_trace(go.Scatter(
-                        x=[comment_time - baseline_window, comment_time],
-                        y=[mean_val_red_pre, mean_val_red_pre],
-                        mode='lines',
-                        line=dict(color='blue', width=3),
-                        name='Baseline Mean',
-                        showlegend=False
-                    ))
-
-                # ---- Fixed-window advanced statistics (relative to Standing comment) ----
-                # fixed_window_sec is now defined once above, outside the loop
-
-                if series_m is not None and times is not None:
-                    # Fixed window: [Standing time, Standing time + fixed_window_sec]
-                    t_start = comment_time
-                    t_end = comment_time + analysis_window_sec
-
-                    mask_win = (times >= t_start) & (times <= t_end)
-                    t_segment = times[mask_win]
-                    y_segment = series_m[mask_win]
-
-                    if len(t_segment) < 2 or not np.isfinite(y_segment).any():
-                        continue
-
-                    # Reference value for computations
-                    # --- Reference value for computations ---
-                    if use_baseline_as_ref and np.isfinite(mean_val_red_pre):
-                        ref_value = mean_val_red_pre
-                        ref_label = "Baseline"
-                    else:
-                        ref_value = y_segment[0]
-                        ref_label = "V<sub>start</sub>"
-                    analysis_window_start_value = y_segment[0]
-                    analysis_window_end_value = y_segment[-1]
-
-                    if not np.isfinite(ref_value):
-                        continue
-
-                    # --- Shading relative to reference value ---
-                    # Below reference (red)
-                    y_below = np.minimum(y_segment, ref_value)
-
-                    fig.add_trace(go.Scatter(
-                        x=np.concatenate([t_segment, t_segment[::-1]]),
-                        y=np.concatenate([y_below, np.full_like(y_below, ref_value)]),
-                        fill='toself',
-                        fillcolor='rgba(255,0,0,0.25)',
-                        line=dict(color='rgba(255,0,0,0.5)', width=1),
-                        name='Below start',
-                        showlegend=False
-                    ))
-
-                    # Above reference (green) — only if enabled
-                    if not only_below_start:
-                        y_above = np.maximum(y_segment, ref_value)
-
-                        fig.add_trace(go.Scatter(
-                            x=np.concatenate([t_segment, t_segment[::-1]]),
-                            y=np.concatenate([y_above, np.full_like(y_above, ref_value)]),
-                            fill='toself',
-                            fillcolor='rgba(0,200,0,0.25)',
-                            line=dict(color='rgba(0,200,0,0.5)', width=1),
-                            name='Above start',
-                            showlegend=False
-                        ))
-
-                    # Start / End markers (Standing → Standing + window)
-                    fig.add_trace(go.Scatter(
-                        x=[t_start],
-                        y=[ref_value],
-                        mode='markers',
-                        marker=dict(size=12, color='lime', symbol='diamond'),
-                        showlegend=False,
-                        name='Start of Analysis Window'
-                    ))
-                    fig.add_trace(go.Scatter(
-                        x=[t_end],
-                        y=[y_segment[-1]],
-                        mode='markers',
-                        marker=dict(size=12, color='lime', symbol='diamond'),
-                        showlegend=False,
-                        name='End of Analysis Window'
-                    ))
-                    
-
-                    # Metrics (relative to reference value)
-                    duration_ms = analysis_window_sec * 1000
-                    # --- Minimum used for DROP computation ---
-                    if only_below_start:
-                        valid_mask = y_segment < ref_value
-                    else:
-                        valid_mask = np.isfinite(y_segment)
-
-                    if np.any(valid_mask):
-                        min_val = np.nanmin(y_segment[valid_mask])
-                        idx_min = np.nanargmin(y_segment[valid_mask])
-                        t_min = t_segment[valid_mask][idx_min]
-                    else:
-                        min_val = np.nan
-                        t_min = np.nan
-                    # --- Red triangle: minimum used for DROP ---
-                    if np.isfinite(min_val):
-                        fig.add_trace(go.Scatter(
-                            x=[t_min],
-                            y=[min_val],
-                            mode='markers',
-                            marker=dict(size=16, color='red', symbol='triangle-down'),
-                            name='Drop minimum',
-                            showlegend=False
-                        ))
-                    perc_drop = ((ref_value - min_val) / ref_value) * 100 if ref_value != 0 else np.nan
-                    if only_below_start:
-                        diff = np.maximum(ref_value - y_segment, 0)
-                    else:
-                        diff = ref_value - y_segment
-                    area_raw = np.trapezoid(diff, t_segment)
-                    area_rel = area_raw / ref_value if ref_value != 0 else np.nan
-
-                    fig.add_annotation(
-                        x=t_start + analysis_window_sec / 2,
-                        xref='x',
-                        y=0.98,
-                        yref='paper',
-                        text=(
-                            f"<b>Standing Response:</b><br>"
-                            f"B<sub>mean</sub>: {mean_val_red_pre:.2f}<br>"
-                            f"T: {duration_ms/1000:.0f} sec<br>"
-                            f"{ref_label}: {ref_value:.2f}<br>"
-                            f"V<sub>end</sub>: {analysis_window_end_value:.2f}<br>"
-                            f"V<sub>min</sub>: {min_val:.2f}<br>"
-                            f"Drop: {perc_drop:.1f}%<br>"
-                            f"A<sub>abs</sub>{' (below start)' if only_below_start else ''}: {area_raw:.2f} (abs.)<br>"
-                            f"A<sub>rel</sub>{' (below start)' if only_below_start else ''}: {area_rel:.2f} (rel.)"
-                        ),
-                        showarrow=False,
-                        align='left',
-                        font=dict(color='white', size=14),
-                        bgcolor='rgb(80,80,80)',
-                        bordercolor='gray',
-                        borderwidth=1,
-                        borderpad=6,
-                        xanchor='center',
-                        yanchor='top'
-                    )
-    
-    
-    if not show_stats_view:
-        if not beat_mode and result_df is not None:
-            fig.add_trace(go.Scatter(
-                x=result_df['time_s'], y=result_df[plot_signal], mode='lines', name='Aggregated',
-                line=dict(color='orange', width=2.5)
+                x=df['time_s'], y=df[plot_signal], mode='lines', name='Filtered',
+                line=dict(color='cyan', width=1,),
+                hovertemplate="Time: %{customdata}<br>Value: %{y}<extra></extra>",
+                customdata=df['time_s'].apply(sec_to_mmss_millis)
             ))
         else:
-            agg5_moving_map = st.session_state.get('agg5_moving_map', {})
-            # agg5_block_map  = st.session_state.get('agg5_block_map', {})
+            # --- Stats view: show moving mean, but add other lines as legendonly ---
+            # Add moving mean line (same as in non-stats view, but always shown)
+            series_m = None
+            times = None
+            if beat_mode:
+                agg5_moving_map = st.session_state.get('agg5_moving_map', {})
+                series_m = agg5_moving_map.get(plot_signal, None)
+                times = df['time_s'].values
+            elif result_df is not None and plot_signal in result_df.columns:
+                series_m = result_df[plot_signal].values
+                times = result_df['time_s'].values
+            if series_m is not None:
+                fig.add_trace(go.Scatter(
+                    x=df['time_s'], y=series_m, mode='lines', name='Moving Mean',
+                    line=dict(color='orange', width=3)
+                ))
+            # Add Raw and Filtered lines, but set visible='legendonly'
+            # Raw
+            if plot_signal == fallback_signal:
+                fig.add_trace(go.Scatter(
+                    x=df['time_s'], y=df['unfiltered_signal_Ch_18'], mode='lines', name='Raw (unfiltered)',
+                    line=dict(color='rgba(200,200,200,0.5)', width=1),
+                    visible='legendonly'
+                ))
+            elif plot_signal in ['1: Finger Pressure', '2: MAP', '3: Systolic', '4: Diastolic']:
+                if plot_signal == '1: Finger Pressure':
+                    raw_name = "Raw (unfiltered)"
+                else:
+                    raw_name = "Raw (Finger Pressure)"
+                fig.add_trace(go.Scatter(
+                    x=df['time_s'], y=df['unfiltered_signal'], mode='lines', name=raw_name,
+                    line=dict(color='rgba(200,200,200,0.5)', width=1),
+                    visible='legendonly'
+                ))
+            # Filtered
+            fig.add_trace(go.Scatter(
+                x=df['time_s'], y=df[plot_signal], mode='lines', name='Filtered',
+                line=dict(color='cyan', width=1,),
+                hovertemplate="Time: %{customdata}<br>Value: %{y}<extra></extra>",
+                customdata=df['time_s'].apply(sec_to_mmss_millis),
+                visible='legendonly'
+            ))
+            # Local Highs markers, legendonly
             # Choose correct peaks for markers: CBF uses its own peaks
             if plot_signal == fallback_signal:
                 peaks_idx = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
             else:
                 peaks_idx = st.session_state.get('peaks_idx', np.array([], dtype=int))
-            series_m = agg5_moving_map.get(plot_signal, None)
-            # series_b = agg5_block_map.get(plot_signal, None)
-            if series_m is not None and np.isfinite(series_m).any():
-                fig.add_trace(go.Scatter(
-                    x=df['time_s'], y=series_m, mode='lines', name=f'Moving mean ({beats_k} peaks)',
-                    line=dict(color='orange', width=3)
-                ))
-            # if series_b is not None and np.isfinite(series_b).any():
-            #     fig.add_trace(go.Scatter(
-            #         x=df['time_s'], y=series_b, mode='lines', name=f'Block average (per {beats_k} beats)',
-            #         line=dict(width=3)
-            #     ))
             if peaks_idx.size > 0 and plot_signal in ['1: Finger Pressure', '6: CBF']:
                 fig.add_trace(go.Scatter(
                     x=df['time_s'].iloc[peaks_idx],
                     y=df[plot_signal].iloc[peaks_idx],
                     mode='markers',
                     name='Local Highs',
-                    marker=dict(size=6, color='orange', symbol='circle-open')
+                    marker=dict(size=6, color='orange', symbol='circle-open'),
+                    visible='legendonly'
                 ))
 
-    comment_locs = df[df['comment'].notna() & (df['comment'] != '')]
-    for _, row_ in comment_locs.iterrows():
-        label = str(row_['comment'])[:20] + "…" if len(row_['comment']) > 20 else row_['comment']
-        fig.add_vline(x=row_['time_s'], line_width=1, line_dash='dash', line_color='lightgray', opacity=0.6)
-        fig.add_annotation(x=row_['time_s'], y=0, text=label, showarrow=False, yanchor="bottom", textangle=-90,
-                           font=dict(size=10, color="lightgray"), bgcolor="rgba(0,0,0,0)")
-
-    tmin = float(np.nanmin(df['time_s'])) if len(df) else 0.0
-    tmax = float(np.nanmax(df['time_s'])) if len(df) else 0.0
-    if np.isfinite(tmin) and np.isfinite(tmax) and tmax > tmin:
-        start = max(0.0, tmin)
-        step = 300.0  # 5 minutes
-        if (tmax - start) < step:
-            step = max((tmax - start) / 5.0, 1.0)
-        tickvals = np.arange(start, tmax + step, step)
-        ticktext = [f"{int(tv // 60):02d}:{int(tv % 60):02d}" for tv in tickvals]
-    else:
-        tickvals = []
-        ticktext = []
-
-    fig.update_layout(
-        height=750, width=1500,
-        plot_bgcolor='#121212', paper_bgcolor='#121212',
-        font=dict(color='white'),
-        title=dict(text=f"{plot_signal} – Combined Signal Visualization", x=0.01, xanchor='left'),
-        xaxis=dict(
-            title='Time (mm:ss)',
-            tickmode='array',
-            tickvals=tickvals,
-            ticktext=ticktext,
-            gridcolor='rgba(80,80,80,0.3)',
-            linecolor='white'
-        ),
-        yaxis=dict(
-            title='Amplitude',
-            gridcolor='rgba(80,80,80,0.3)',
-            linecolor='white'
-        ),
-        yaxis2=dict(
-            title='HR (bpm)',
-            overlaying='y',
-            side='right',
-            showgrid=False,
-            rangemode='tozero'
-        ),
-        legend=dict(
-            orientation="v", y=0.98, x=0.98, font=dict(size=11),
-            bgcolor="rgba(18,18,18,0.8)", bordercolor="gray", borderwidth=1
-        ),
-        margin=dict(t=80, l=60, r=40, b=50)
-    )
-
-    st.plotly_chart(fig, use_container_width=True)
-
-    if show_stats_view and plot_signal in ['1: Finger Pressure', '6: CBF']:
-        # Add text annotation at the bottom-right corner (updated to match current computation logic)
-        st.markdown(
-            """
-            <div style="text-align:left; font-size:14px; color:white; background-color:rgba(0,0,0,0.65); padding:10px; border-radius:6px; max-width:420px;">
-
-            <b>Baseline mean (B<sub>mean</sub>):</b><br>
-            Mean value in the baseline window before Standing<br>
+        # === Add horizontal mean lines and peak markers for "Standing" comments if plotting Finger Pressure or CBF ===
+        if show_stats_view:
+            if plot_signal in ['1: Finger Pressure', '6: CBF']:
             
-            <b>Duration (T):</b><br>
-            T = analysis window (s)<br>
-
-            <b>Start value (V<sub>start</sub>):</b><br>
-            V<sub>start</sub> = signal at Standing time<br>
-
-            <b>End value (V<sub>end</sub>):</b><br>
-            V<sub>end</sub> = signal at V<sub>start</sub> + T<br>
-
-            <b>Min value (V<sub>min</sub>):</b><br>
-            V<sub>min</sub> = min(V(t)) within window<br>
+                # Find all comment rows containing "Standing"
+                standing_comments = df[df['comment'].astype(str).str.strip() == "Standing"]
+                baseline_window = st.number_input("Baseline window (seconds)", min_value=10, max_value=600, value=120, step=10, help="Represents the time window for computing the baseline mean. The window ends at the moment determined by the 'Baseline end event' option below.", key="baseline_window")
             
-            <b>Drop (%):</b><br>
-            Drop = (V<sub>start</sub> − V<sub>min</sub>) / V<sub>start</sub> × 100<br>
+                baseline_end_event = st.radio(
+                    "Baseline end event",
+                    options=["Transition comment", "Standing comment"],
+                    index=0,
+                    horizontal=True,
+                    help="Choose whether the baseline window ends at the 'Transition period' comment or the 'Standing' comment.",
+                    key="baseline_end_event"
+                )
 
-            <b>Area (absolute):</b><br>
-            A<sub>abs</sub> = ∫ (V<sub>start</sub> − V(t)) dt<br>
 
-            <b>Area (relative):</b><br>
-            A<sub>rel</sub> = A<sub>abs</sub> / V<sub>start</sub>
-            </div>
-            """,
-            unsafe_allow_html=True
+                # ---- Fixed-window parameter (defined once to avoid Streamlit duplicate IDs) ----
+                analysis_window_sec = st.number_input(
+                    "Analysis window after Standing (seconds)",
+                    min_value=1,
+                    max_value=30,
+                    value=10,
+                    step=1,
+                    key="fixed_window_after_standing_sec"
+                )
+
+                # ---- Area computation option ----
+                only_below_start = st.checkbox(
+                    "Compute area only below Standing value",
+                    value=True,
+                    help="If enabled, only deviations below the Standing start value are shaded and integrated.",
+                    key="only_below_start"
+                )
+
+                use_baseline_as_ref = st.checkbox(
+                    "Use baseline mean as reference (instead of Vstart)",
+                    value=False,
+                    help="If enabled, baseline mean before Standing is used as the reference for drop and area computations.",
+                    key="use_baseline_as_ref"
+                )
+
+                transition_comments = df[df['comment'].astype(str).str.contains("Transition period", case=False, na=False)]
+
+                for _, row_stand in standing_comments.iterrows():
+                    comment_time = row_stand['time_s']
+                
+                    # Always compute transition start time for duration display
+                    past_transitions = transition_comments[transition_comments['time_s'] <= comment_time]
+                    transition_start_time = past_transitions.iloc[-1]['time_s'] if not past_transitions.empty else comment_time
+                    transition_duration_sec = comment_time - transition_start_time
+
+                    if transition_duration_sec > 0:
+                        fig.add_vrect(
+                            x0=transition_start_time, x1=comment_time,
+                            fillcolor="orange", opacity=0.15, line_width=0,
+                            annotation_text="Transition", annotation_position="top left",
+                            annotation_font_size=12
+                        )
+
+                    # Find the baseline end time based on user choice
+                    if baseline_end_event == "Transition comment":
+                        baseline_end_time = transition_start_time
+                    else:
+                        baseline_end_time = comment_time
+
+                    # --- red Line 1: mean before Standing (or transition) ---
+                    mask_red_pre = (times >= baseline_end_time - baseline_window) & (times <= baseline_end_time)
+                    mean_val_red_pre = np.nanmean(series_m[mask_red_pre]) if series_m is not None else np.nan
+                    if np.isfinite(mean_val_red_pre):
+                        fig.add_trace(go.Scatter(
+                            x=[baseline_end_time - baseline_window, baseline_end_time],
+                            y=[mean_val_red_pre, mean_val_red_pre],
+                            mode='lines',
+                            line=dict(color='blue', width=3),
+                            name='Baseline Mean',
+                            showlegend=False
+                        ))
+
+                    # ---- Fixed-window advanced statistics (relative to Standing comment) ----
+                    # fixed_window_sec is now defined once above, outside the loop
+
+                    if series_m is not None and times is not None:
+                        # Fixed window: [Standing time, Standing time + fixed_window_sec]
+                        t_start = comment_time
+                        t_end = comment_time + analysis_window_sec
+
+                        mask_win = (times >= t_start) & (times <= t_end)
+                        t_segment = times[mask_win]
+                        y_segment = series_m[mask_win]
+
+                        if len(t_segment) < 2 or not np.isfinite(y_segment).any():
+                            continue
+
+                        # Reference value for computations
+                        # --- Reference value for computations ---
+                        if use_baseline_as_ref and np.isfinite(mean_val_red_pre):
+                            ref_value = mean_val_red_pre
+                            ref_label = "Baseline"
+                        else:
+                            ref_value = y_segment[0]
+                            ref_label = "V<sub>start</sub>"
+                        analysis_window_start_value = y_segment[0]
+                        analysis_window_end_value = y_segment[-1]
+
+                        if not np.isfinite(ref_value):
+                            continue
+
+                        # --- Shading relative to reference value ---
+                        # Below reference (red)
+                        y_below = np.minimum(y_segment, ref_value)
+
+                        fig.add_trace(go.Scatter(
+                            x=np.concatenate([t_segment, t_segment[::-1]]),
+                            y=np.concatenate([y_below, np.full_like(y_below, ref_value)]),
+                            fill='toself',
+                            fillcolor='rgba(255,0,0,0.25)',
+                            line=dict(color='rgba(255,0,0,0.5)', width=1),
+                            name='Below start',
+                            showlegend=False
+                        ))
+
+                        # Above reference (green) — only if enabled
+                        if not only_below_start:
+                            y_above = np.maximum(y_segment, ref_value)
+
+                            fig.add_trace(go.Scatter(
+                                x=np.concatenate([t_segment, t_segment[::-1]]),
+                                y=np.concatenate([y_above, np.full_like(y_above, ref_value)]),
+                                fill='toself',
+                                fillcolor='rgba(0,200,0,0.25)',
+                                line=dict(color='rgba(0,200,0,0.5)', width=1),
+                                name='Above start',
+                                showlegend=False
+                            ))
+
+                        # Start / End markers (Standing → Standing + window)
+                        fig.add_trace(go.Scatter(
+                            x=[t_start],
+                            y=[ref_value],
+                            mode='markers',
+                            marker=dict(size=12, color='lime', symbol='diamond'),
+                            showlegend=False,
+                            name='Start of Analysis Window'
+                        ))
+                        fig.add_trace(go.Scatter(
+                            x=[t_end],
+                            y=[y_segment[-1]],
+                            mode='markers',
+                            marker=dict(size=12, color='lime', symbol='diamond'),
+                            showlegend=False,
+                            name='End of Analysis Window'
+                        ))
+                    
+
+                        # Metrics (relative to reference value)
+                        duration_ms = analysis_window_sec * 1000
+                        # --- Minimum used for DROP computation ---
+                        if only_below_start:
+                            valid_mask = y_segment < ref_value
+                        else:
+                            valid_mask = np.isfinite(y_segment)
+
+                        if np.any(valid_mask):
+                            min_val = np.nanmin(y_segment[valid_mask])
+                            idx_min = np.nanargmin(y_segment[valid_mask])
+                            t_min = t_segment[valid_mask][idx_min]
+                        else:
+                            min_val = np.nan
+                            t_min = np.nan
+                        # --- Red triangle: minimum used for DROP ---
+                        if np.isfinite(min_val):
+                            fig.add_trace(go.Scatter(
+                                x=[t_min],
+                                y=[min_val],
+                                mode='markers',
+                                marker=dict(size=16, color='red', symbol='triangle-down'),
+                                name='Drop minimum',
+                                showlegend=False
+                            ))
+                        perc_drop = ((ref_value - min_val) / ref_value) * 100 if ref_value != 0 else np.nan
+                        if only_below_start:
+                            diff = np.maximum(ref_value - y_segment, 0)
+                        else:
+                            diff = ref_value - y_segment
+                        area_raw = np.trapz(diff, t_segment)
+                        area_rel = area_raw / ref_value if ref_value != 0 else np.nan
+
+                        fig.add_annotation(
+                            x=t_start + analysis_window_sec / 2,
+                            xref='x',
+                            y=0.98,
+                            yref='paper',
+                            text=(
+                                f"<b>Standing Response:</b><br>"
+                                f"B<sub>mean</sub>: {mean_val_red_pre:.2f}<br>"
+                                f"Transition: {transition_duration_sec:.1f} s<br>"
+                                f"T: {duration_ms/1000:.0f} sec<br>"
+                                f"{ref_label}: {ref_value:.2f}<br>"
+                                f"V<sub>end</sub>: {analysis_window_end_value:.2f}<br>"
+                                f"V<sub>min</sub>: {min_val:.2f}<br>"
+                                f"Drop: {perc_drop:.1f}%<br>"
+                                f"A<sub>abs</sub>{' (below start)' if only_below_start else ''}: {area_raw:.2f} (abs.)<br>"
+                                f"A<sub>rel</sub>{' (below start)' if only_below_start else ''}: {area_rel:.2f} (rel.)"
+                            ),
+                            showarrow=False,
+                            align='left',
+                            font=dict(color='white', size=14),
+                            bgcolor='rgb(80,80,80)',
+                            bordercolor='gray',
+                            borderwidth=1,
+                            borderpad=6,
+                            xanchor='center',
+                            yanchor='top'
+                        )
+    
+    
+        if not show_stats_view:
+            if not beat_mode and result_df is not None:
+                fig.add_trace(go.Scatter(
+                    x=result_df['time_s'], y=result_df[plot_signal], mode='lines', name='Aggregated',
+                    line=dict(color='orange', width=2.5)
+                ))
+            else:
+                agg5_moving_map = st.session_state.get('agg5_moving_map', {})
+                # agg5_block_map  = st.session_state.get('agg5_block_map', {})
+                # Choose correct peaks for markers: CBF uses its own peaks
+                if plot_signal == fallback_signal:
+                    peaks_idx = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
+                else:
+                    peaks_idx = st.session_state.get('peaks_idx', np.array([], dtype=int))
+                series_m = agg5_moving_map.get(plot_signal, None)
+                # series_b = agg5_block_map.get(plot_signal, None)
+                if series_m is not None and np.isfinite(series_m).any():
+                    fig.add_trace(go.Scatter(
+                        x=df['time_s'], y=series_m, mode='lines', name=f'Moving mean ({beats_k} peaks)',
+                        line=dict(color='orange', width=3)
+                    ))
+                # if series_b is not None and np.isfinite(series_b).any():
+                #     fig.add_trace(go.Scatter(
+                #         x=df['time_s'], y=series_b, mode='lines', name=f'Block average (per {beats_k} beats)',
+                #         line=dict(width=3)
+                #     ))
+                if peaks_idx.size > 0 and plot_signal in ['1: Finger Pressure', '6: CBF']:
+                    fig.add_trace(go.Scatter(
+                        x=df['time_s'].iloc[peaks_idx],
+                        y=df[plot_signal].iloc[peaks_idx],
+                        mode='markers',
+                        name='Local Highs',
+                        marker=dict(size=6, color='orange', symbol='circle-open')
+                    ))
+
+        comment_locs = df[df['comment'].notna() & (df['comment'] != '')]
+        for _, row_ in comment_locs.iterrows():
+            label = str(row_['comment'])[:20] + "…" if len(row_['comment']) > 20 else row_['comment']
+            fig.add_vline(x=row_['time_s'], line_width=1, line_dash='dash', line_color='lightgray', opacity=0.6)
+            fig.add_annotation(x=row_['time_s'], y=0, text=label, showarrow=False, yanchor="bottom", textangle=-90,
+                               font=dict(size=10, color="lightgray"), bgcolor="rgba(0,0,0,0)")
+
+        tmin = float(np.nanmin(df['time_s'])) if len(df) else 0.0
+        tmax = float(np.nanmax(df['time_s'])) if len(df) else 0.0
+        if np.isfinite(tmin) and np.isfinite(tmax) and tmax > tmin:
+            start = max(0.0, tmin)
+            step = 300.0  # 5 minutes
+            if (tmax - start) < step:
+                step = max((tmax - start) / 5.0, 1.0)
+            tickvals = np.arange(start, tmax + step, step)
+            ticktext = [f"{int(tv // 60):02d}:{int(tv % 60):02d}" for tv in tickvals]
+        else:
+            tickvals = []
+            ticktext = []
+
+        fig.update_layout(
+            height=750, width=1500,
+            plot_bgcolor='#121212', paper_bgcolor='#121212',
+            font=dict(color='white'),
+            title=dict(text=f"{plot_signal} – Combined Signal Visualization", x=0.01, xanchor='left'),
+            xaxis=dict(
+                title='Time (mm:ss)',
+                tickmode='array',
+                tickvals=tickvals,
+                ticktext=ticktext,
+                gridcolor='rgba(80,80,80,0.3)',
+                linecolor='white'
+            ),
+            yaxis=dict(
+                title='Amplitude',
+                gridcolor='rgba(80,80,80,0.3)',
+                linecolor='white'
+            ),
+            yaxis2=dict(
+                title='HR (bpm)',
+                overlaying='y',
+                side='right',
+                showgrid=False,
+                rangemode='tozero'
+            ),
+            legend=dict(
+                orientation="v", y=0.98, x=0.98, font=dict(size=11),
+                bgcolor="rgba(18,18,18,0.8)", bordercolor="gray", borderwidth=1
+            ),
+            margin=dict(t=80, l=60, r=40, b=50)
         )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+        if show_stats_view and plot_signal in ['1: Finger Pressure', '6: CBF']:
+            with st.expander("📖 Explanation of Metrics & Formulas", expanded=True):
+                st.markdown(
+                    """
+| Metric | Description |
+| :--- | :--- |
+| **Baseline mean ($B_{mean}$)** | Mean value in the baseline window before Standing |
+| **Duration (T)** | $T$ = analysis window (s) |
+| **Start value ($V_{start}$)** | $V_{start}$ = signal at Standing time |
+| **End value ($V_{end}$)** | $V_{end}$ = signal at $V_{start} + T$ |
+| **Min value ($V_{min}$)** | $V_{min} = \min(V(t))$ within window |
+| **Drop (%)** | Drop = $(V_{start} - V_{min}) / V_{start} \\times 100$ |
+| **Area (absolute)** | $A_{abs} = \\int (V_{start} - V(t)) dt$ |
+| **Area (relative)** | $A_{rel} = A_{abs} / V_{start}$ |
+                    """
+                )
     
 
-    # === Excel Export ===
-    st.markdown("#### Export data to Excel")
-    if st.button("Export Excel"):
-        with st.spinner("Building Excel file…"):
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
-                # -------- Sheet 1: Filtered(200hz) --------
-                cols_filtered = ['absolute_time', 'time_s', 'time_mmss_millis', 'comment'] + [
-                    c for c in all_signals if c in df.columns
-                ]
-                filtered_df = df[cols_filtered].copy()
-                if 'comment' in filtered_df.columns:
-                    filtered_df['comment'] = filtered_df['comment'].astype(object)
-                filtered_df.to_excel(writer, index=False, sheet_name="Filtered(200hz)")
+        # === Excel Export ===
+        st.markdown("#### Export data to Excel")
+        if st.button("Export Excel"):
+            with st.spinner("Building Excel file…"):
+                buffer = io.BytesIO()
+                with pd.ExcelWriter(buffer, engine='xlsxwriter') as writer:
+                    # -------- Sheet 1: Filtered(200hz) --------
+                    cols_filtered = ['absolute_time', 'time_s', 'time_mmss_millis', 'comment'] + [
+                        c for c in all_signals if c in df.columns
+                    ]
+                    filtered_df = df[cols_filtered].copy()
+                    if 'comment' in filtered_df.columns:
+                        filtered_df['comment'] = filtered_df['comment'].astype(object)
+                    filtered_df.to_excel(writer, index=False, sheet_name="Filtered(200hz)")
 
-                # -------- Sheet 2: Resampled --------
-                if beat_mode:
-                    # Beat-based mode (use agg5_moving_map)
-                    agg5_moving_map = st.session_state.get('agg5_moving_map', {})
-                    peaks_fp = st.session_state.get('peaks_idx', np.array([], dtype=int))
-                    peaks_cbf = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
+                    # -------- Sheet 2: Resampled --------
+                    if beat_mode:
+                        # Beat-based mode (use agg5_moving_map)
+                        agg5_moving_map = st.session_state.get('agg5_moving_map', {})
+                        peaks_fp = st.session_state.get('peaks_idx', np.array([], dtype=int))
+                        peaks_cbf = st.session_state.get('peaks_idx_cbf', np.array([], dtype=int))
 
-                    if isinstance(agg5_moving_map, dict) and len(agg5_moving_map) > 0:
-                        abs_time = pd.to_datetime(df['absolute_time'])
-                        time_diff = abs_time.diff().dt.total_seconds().fillna(0)
-                        time_s_fixed = time_diff.cumsum()
-                        time_mmss_millis_fixed = time_s_fixed.apply(sec_to_mmss_millis)
+                        if isinstance(agg5_moving_map, dict) and len(agg5_moving_map) > 0:
+                            abs_time = pd.to_datetime(df['absolute_time'])
+                            time_diff = abs_time.diff().dt.total_seconds().fillna(0)
+                            time_s_fixed = time_diff.cumsum()
+                            time_mmss_millis_fixed = time_s_fixed.apply(sec_to_mmss_millis)
 
-                        def _peaks_flag(n, peaks_idx_arr):
-                            arr = np.zeros(n, dtype=int)
-                            if peaks_idx_arr is not None and hasattr(peaks_idx_arr, 'size') and peaks_idx_arr.size > 0:
-                                valid = peaks_idx_arr[(peaks_idx_arr >= 0) & (peaks_idx_arr < n)]
-                                arr[valid] = 1
-                            return arr
+                            def _peaks_flag(n, peaks_idx_arr):
+                                arr = np.zeros(n, dtype=int)
+                                if peaks_idx_arr is not None and hasattr(peaks_idx_arr, 'size') and peaks_idx_arr.size > 0:
+                                    valid = peaks_idx_arr[(peaks_idx_arr >= 0) & (peaks_idx_arr < n)]
+                                    arr[valid] = 1
+                                return arr
 
-                        # Reference start time
-                        t0_dt = pd.to_datetime(df['absolute_time'].iloc[0])
+                            # Reference start time
+                            t0_dt = pd.to_datetime(df['absolute_time'].iloc[0])
 
-                        merged_cols = {
-                            "Datetime": df["absolute_time"],
-                            "Elapsed Time (s)": (pd.to_datetime(df["absolute_time"]) - t0_dt).dt.total_seconds(),
-                            "Elapsed Time (mm:ss.ms)": (pd.to_datetime(df["absolute_time"]) - t0_dt).dt.total_seconds().apply(sec_to_mmss_millis),
-                            "comment": df["comment"],
-                            "local_high_FP": _peaks_flag(len(df), peaks_fp),
-                            "local_high_CBF": _peaks_flag(len(df), peaks_cbf),
-                        }
+                            merged_cols = {
+                                "Datetime": df["absolute_time"],
+                                "Elapsed Time (s)": (pd.to_datetime(df["absolute_time"]) - t0_dt).dt.total_seconds(),
+                                "Elapsed Time (mm:ss.ms)": (pd.to_datetime(df["absolute_time"]) - t0_dt).dt.total_seconds().apply(sec_to_mmss_millis),
+                                "comment": df["comment"],
+                                "local_high_FP": _peaks_flag(len(df), peaks_fp),
+                                "local_high_CBF": _peaks_flag(len(df), peaks_cbf),
+                            }
                         
-                        for sig in all_signals:
-                            series = agg5_moving_map.get(sig, None)
-                            if series is not None:
-                                merged_cols[f'{sig} - MovingMean({beats_k}beats)'] = series
+                            for sig in all_signals:
+                                series = agg5_moving_map.get(sig, None)
+                                if series is not None:
+                                    merged_cols[f'{sig} - MovingMean({beats_k}beats)'] = series
 
-                        df_resampled = pd.DataFrame(merged_cols)
-                        df_resampled['comment'] = df_resampled['comment'].replace(r'^\s*$', np.nan, regex=True)
+                            df_resampled = pd.DataFrame(merged_cols)
+                            df_resampled['comment'] = df_resampled['comment'].replace(r'^\s*$', np.nan, regex=True)
 
-                        # Mask signals based on local_high flags
-                        for col in df_resampled.columns:
-                            if col.endswith(f'MovingMean({beats_k}beats)'):
-                                if col.startswith("6: CBF"):
-                                    df_resampled.loc[df_resampled['local_high_CBF'] == 0, col] = np.nan
+                            # Mask signals based on local_high flags
+                            for col in df_resampled.columns:
+                                if col.endswith(f'MovingMean({beats_k}beats)'):
+                                    if col.startswith("6: CBF"):
+                                        df_resampled.loc[df_resampled['local_high_CBF'] == 0, col] = np.nan
+                                    else:
+                                        df_resampled.loc[df_resampled['local_high_FP'] == 0, col] = np.nan
+
+                            # Keep only rows with peaks or comments
+                            df_resampled = df_resampled[
+                                (df_resampled['local_high_FP'] == 1) |
+                                (df_resampled['local_high_CBF'] == 1) |
+                                (df_resampled['comment'].notna())
+                            ]
+                            df_resampled = df_resampled.drop(columns=['local_high_FP', 'local_high_CBF'])
+                            # Identify which columns are signals (exclude timing + comment)
+                            non_signal_cols = ['Datetime', 'Elapsed Time (s)', 'Elapsed Time (mm:ss.ms)', 'comment']
+
+                            # For comment rows, blank out only the signal values
+                            df_resampled.loc[df_resampled['comment'].notna(),
+                                            df_resampled.columns.difference(non_signal_cols)] = np.nan
+
+                            sheet_name = f"Resampled({beats_k}beats)"
+                            df_resampled.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+
+                    else:
+                        label_to_sec = {
+                            "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
+                            "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60,
+                        }
+                        current_choice = st.session_state.get('bin_choice_label', None)
+                        selected_label = (
+                            current_choice if current_choice in label_to_sec
+                            else st.session_state.get('last_time_bin_label', '1 min')
+                        )
+
+                        if selected_label in label_to_sec:
+                            bin_sec = float(label_to_sec[selected_label])
+
+                            df_tmp = df.copy()
+                            t0 = float(df_tmp['time_s'].iloc[0]) if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any() else 0.0
+
+                            # Assign time bins
+                            df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
+
+                            # Aggregate by bin (exclude comments here to avoid duplication)
+                            resampled = df_tmp.groupby('time_bin').agg(
+                                {**{c: 'mean' for c in all_signals},
+                                'absolute_time': 'first',
+                                'time_s': 'first',
+                                'time_mmss_millis': 'first'}
+                            ).reset_index(drop=True)
+
+                            # --- recompute timing from absolute_time ---
+                            abs_time = pd.to_datetime(resampled['absolute_time'])
+                            time_diff = abs_time.diff().dt.total_seconds().fillna(0)
+                            time_s_fixed = time_diff.cumsum()
+                            time_mmss_millis_fixed = time_s_fixed.apply(sec_to_mmss_millis)
+
+                            resampled['Datetime'] = abs_time
+                            resampled['Elapsed Time (s)'] = time_s_fixed
+                            resampled['Elapsed Time (mm:ss.ms)'] = time_mmss_millis_fixed
+
+                            # Drop old cols
+                            resampled = resampled.drop(columns=['absolute_time', 'time_s', 'time_mmss_millis'], errors="ignore")
+
+                            # === Insert comments ONLY once at their real absolute time ===
+                            comment_rows = []
+                            if df_comments is not None and not df_comments.empty:
+                                t0_dt = abs_time.iloc[0]
+                                for _, ev in df_comments.iterrows():
+                                    abs_t = pd.to_datetime(ev["absolute_time"])
+                                    comment_text = str(ev["comment_text"])
+                                    elapsed_sec = (abs_t - t0_dt).total_seconds()
+
+                                    comment_rows.append({
+                                        "Datetime": abs_t,
+                                        "Elapsed Time (s)": elapsed_sec,
+                                        "Elapsed Time (mm:ss.ms)": sec_to_mmss_millis(elapsed_sec),
+                                        "comment": comment_text,
+                                        **{c: np.nan for c in all_signals}
+                                    })
+
+                            if comment_rows:
+                                resampled = pd.concat([resampled, pd.DataFrame(comment_rows)], ignore_index=True)
+
+                                # Merge rows with same Datetime (keep numeric values, merge comments)
+                                resampled = (
+                                    resampled.groupby("Datetime", as_index=False)
+                                    .agg(lambda x: " ".join([str(i) for i in x.dropna().unique()]) if x.dtype == object else x.mean())
+                                )
+
+                            # Sort by time
+                            resampled = resampled.sort_values("Datetime").reset_index(drop=True)
+
+                            # Ensure Excel-friendly dtype
+                            resampled['comment'] = resampled.get('comment', pd.Series(dtype=object)).astype(object)
+
+                            # Final column order
+                            ordered_cols = (
+                                ['Datetime', 'Elapsed Time (s)', 'Elapsed Time (mm:ss.ms)', 'comment'] +
+                                [c for c in all_signals if c in resampled.columns]
+                            )
+                            resampled = resampled.reindex(columns=ordered_cols)                        # Export
+                            sheet_name = f"Resampled({selected_label})"
+                            resampled.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+
+                    # -------- Sheet 3: Stats (Finger Pressure) --------
+                    if '1: Finger Pressure' in all_signals:
+                        fp_stats = []
+                        standing_comments_fp = df[df['comment'].astype(str).str.strip() == "Standing"]
+                        transition_comments_fp = df[df['comment'].astype(str).str.contains("Transition period", case=False, na=False)]
+                        
+                        bl_win = st.session_state.get("baseline_window", 120)
+                        bl_event = st.session_state.get("baseline_end_event", "Transition comment")
+                        an_win_sec = st.session_state.get("fixed_window_after_standing_sec", 10)
+                        only_below = st.session_state.get("only_below_start", True)
+                        use_bl_ref = st.session_state.get("use_baseline_as_ref", False)
+                        
+                        series_m_fp = None
+                        if not beat_mode and result_df is not None and '1: Finger Pressure' in result_df.columns:
+                            series_m_fp = result_df['1: Finger Pressure'].values
+                            times_fp = result_df['time_s'].values
+                        else:
+                            agg5_moving_map = st.session_state.get('agg5_moving_map', {})
+                            series_m_fp = agg5_moving_map.get('1: Finger Pressure', None)
+                            times_fp = df['time_s'].values
+                            
+                        if series_m_fp is not None:
+                            for _, row_stand in standing_comments_fp.iterrows():
+                                comment_time = row_stand['time_s']
+                                past_transitions = transition_comments_fp[transition_comments_fp['time_s'] <= comment_time]
+                                transition_start_time = past_transitions.iloc[-1]['time_s'] if not past_transitions.empty else comment_time
+                                transition_duration_sec = comment_time - transition_start_time
+                                
+                                if bl_event == "Transition comment":
+                                    baseline_end_time = transition_start_time
                                 else:
-                                    df_resampled.loc[df_resampled['local_high_FP'] == 0, col] = np.nan
+                                    baseline_end_time = comment_time
+                                    
+                                mask_red_pre = (times_fp >= baseline_end_time - bl_win) & (times_fp <= baseline_end_time)
+                                mean_val_red_pre = np.nanmean(series_m_fp[mask_red_pre]) if len(times_fp[mask_red_pre]) > 0 else np.nan
+                                
+                                t_start = comment_time
+                                t_end = comment_time + an_win_sec
+                                mask_win = (times_fp >= t_start) & (times_fp <= t_end)
+                                t_segment = times_fp[mask_win]
+                                y_segment = series_m_fp[mask_win]
+                                
+                                if len(t_segment) < 2 or not np.isfinite(y_segment).any():
+                                    continue
+                                    
+                                if use_bl_ref and np.isfinite(mean_val_red_pre):
+                                    ref_value = mean_val_red_pre
+                                else:
+                                    ref_value = y_segment[0]
+                                    
+                                analysis_window_start_value = y_segment[0]
+                                analysis_window_end_value = y_segment[-1]
+                                
+                                if only_below:
+                                    valid_mask = y_segment < ref_value
+                                else:
+                                    valid_mask = np.isfinite(y_segment)
+                                    
+                                if np.any(valid_mask):
+                                    min_val = np.nanmin(y_segment[valid_mask])
+                                else:
+                                    min_val = np.nan
+                                    
+                                perc_drop = ((ref_value - min_val) / ref_value) * 100 if ref_value != 0 else np.nan
+                                
+                                diff = np.maximum(ref_value - y_segment, 0) if only_below else (ref_value - y_segment)
+                                area_raw = np.trapz(diff, t_segment)
+                                area_rel = area_raw / ref_value if ref_value != 0 else np.nan
+                                
+                                fp_stats.append({
+                                    "Standing Time (s)": comment_time,
+                                    "Bmean": mean_val_red_pre,
+                                    "Transition (s)": transition_duration_sec,
+                                    "Duration (T)": an_win_sec,
+                                    "Vstart": analysis_window_start_value,
+                                    "Vend": analysis_window_end_value,
+                                    "Vmin": min_val,
+                                    "Drop (%)": perc_drop,
+                                    "Area (abs)": area_raw,
+                                    "Area (rel)": area_rel
+                                })
+                                
+                        if fp_stats:
+                            df_stats = pd.DataFrame(fp_stats)
+                            df_stats.to_excel(writer, index=False, sheet_name="Stats (FP)")
 
-                        # Keep only rows with peaks or comments
-                        df_resampled = df_resampled[
-                            (df_resampled['local_high_FP'] == 1) |
-                            (df_resampled['local_high_CBF'] == 1) |
-                            (df_resampled['comment'].notna())
-                        ]
-                        df_resampled = df_resampled.drop(columns=['local_high_FP', 'local_high_CBF'])
-                        # Identify which columns are signals (exclude timing + comment)
-                        non_signal_cols = ['Datetime', 'Elapsed Time (s)', 'Elapsed Time (mm:ss.ms)', 'comment']
+                buffer.seek(0)
 
-                        # For comment rows, blank out only the signal values
-                        df_resampled.loc[df_resampled['comment'].notna(),
-                                        df_resampled.columns.difference(non_signal_cols)] = np.nan
-
-                        sheet_name = f"Resampled({beats_k}beats)"
-                        df_resampled.to_excel(writer, index=False, sheet_name=sheet_name[:31])
-
+                # --- Filename ---
+                if beat_mode:
+                    suffix = f"{beats_k}beats"
                 else:
                     label_to_sec = {
-                        "500ms": 0.5, "1 sec": 1, "2 sec": 2, "5 sec": 5,
-                        "10 sec": 10, "15 sec": 15, "30 sec": 30, "1 min": 60,
+                        "500ms": "500ms", "1 sec": "1sec", "2 sec": "2sec", "5 sec": "5sec",
+                        "10 sec": "10sec", "15 sec": "15sec", "30 sec": "30sec", "1 min": "1min"
                     }
                     current_choice = st.session_state.get('bin_choice_label', None)
-                    selected_label = (
-                        current_choice if current_choice in label_to_sec
-                        else st.session_state.get('last_time_bin_label', '1 min')
-                    )
+                    selected_label = current_choice if current_choice in label_to_sec else st.session_state.get('last_time_bin_label', '1 min')
+                    suffix = label_to_sec.get(selected_label, "resampled")
 
-                    if selected_label in label_to_sec:
-                        bin_sec = float(label_to_sec[selected_label])
+                file_name = f"{suffix}_{file_base}.xlsx"
 
-                        df_tmp = df.copy()
-                        t0 = float(df_tmp['time_s'].iloc[0]) if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any() else 0.0
-
-                        # Assign time bins
-                        df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
-
-                        # Aggregate by bin (exclude comments here to avoid duplication)
-                        resampled = df_tmp.groupby('time_bin').agg(
-                            {**{c: 'mean' for c in all_signals},
-                            'absolute_time': 'first',
-                            'time_s': 'first',
-                            'time_mmss_millis': 'first'}
-                        ).reset_index(drop=True)
-
-                        # --- recompute timing from absolute_time ---
-                        abs_time = pd.to_datetime(resampled['absolute_time'])
-                        time_diff = abs_time.diff().dt.total_seconds().fillna(0)
-                        time_s_fixed = time_diff.cumsum()
-                        time_mmss_millis_fixed = time_s_fixed.apply(sec_to_mmss_millis)
-
-                        resampled['Datetime'] = abs_time
-                        resampled['Elapsed Time (s)'] = time_s_fixed
-                        resampled['Elapsed Time (mm:ss.ms)'] = time_mmss_millis_fixed
-
-                        # Drop old cols
-                        resampled = resampled.drop(columns=['absolute_time', 'time_s', 'time_mmss_millis'], errors="ignore")
-
-                        # === Insert comments ONLY once at their real absolute time ===
-                        comment_rows = []
-                        if df_comments is not None and not df_comments.empty:
-                            t0_dt = abs_time.iloc[0]
-                            for _, ev in df_comments.iterrows():
-                                abs_t = pd.to_datetime(ev["absolute_time"])
-                                comment_text = str(ev["comment_text"])
-                                elapsed_sec = (abs_t - t0_dt).total_seconds()
-
-                                comment_rows.append({
-                                    "Datetime": abs_t,
-                                    "Elapsed Time (s)": elapsed_sec,
-                                    "Elapsed Time (mm:ss.ms)": sec_to_mmss_millis(elapsed_sec),
-                                    "comment": comment_text,
-                                    **{c: np.nan for c in all_signals}
-                                })
-
-                        if comment_rows:
-                            resampled = pd.concat([resampled, pd.DataFrame(comment_rows)], ignore_index=True)
-
-                            # Merge rows with same Datetime (keep numeric values, merge comments)
-                            resampled = (
-                                resampled.groupby("Datetime", as_index=False)
-                                .agg(lambda x: " ".join([str(i) for i in x.dropna().unique()]) if x.dtype == object else x.mean())
-                            )
-
-                        # Sort by time
-                        resampled = resampled.sort_values("Datetime").reset_index(drop=True)
-
-                        # Ensure Excel-friendly dtype
-                        resampled['comment'] = resampled.get('comment', pd.Series(dtype=object)).astype(object)
-
-                        # Final column order
-                        ordered_cols = (
-                            ['Datetime', 'Elapsed Time (s)', 'Elapsed Time (mm:ss.ms)', 'comment'] +
-                            [c for c in all_signals if c in resampled.columns]
-                        )
-                        resampled = resampled.reindex(columns=ordered_cols)                        # Export
-                        sheet_name = f"Resampled({selected_label})"
-                        resampled.to_excel(writer, index=False, sheet_name=sheet_name[:31])
-            buffer.seek(0)
-
-            # --- Filename ---
-            if beat_mode:
-                suffix = f"{beats_k}beats"
-            else:
-                label_to_sec = {
-                    "500ms": "500ms", "1 sec": "1sec", "2 sec": "2sec", "5 sec": "5sec",
-                    "10 sec": "10sec", "15 sec": "15sec", "30 sec": "30sec", "1 min": "1min"
-                }
-                current_choice = st.session_state.get('bin_choice_label', None)
-                selected_label = current_choice if current_choice in label_to_sec else st.session_state.get('last_time_bin_label', '1 min')
-                suffix = label_to_sec.get(selected_label, "resampled")
-
-            file_name = f"{suffix}_{file_base}.xlsx"
-
-            st.download_button(
-                label="Download Excel",
-                data=buffer.getvalue(),
-                file_name=file_name,
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
+                st.download_button(
+                    label="Download Excel",
+                    data=buffer.getvalue(),
+                    file_name=file_name,
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
                     
-# Footer
-st.markdown("---")
-col1, col2 = st.columns([0.7, 0.4])
-with col1:
-    st.markdown("© 2025 FAME Laboratory, Greece")
-with col2:
-    st.markdown(
-        "Contact: [konstantinosmantzios@gmail.com](mailto:konstantinosmantzios@gmail.com) | "
-        "[ggkikas77@gmail.com](mailto:ggkikas77@gmail.com)",
-        unsafe_allow_html=True
-    )
+    # Footer
+    st.markdown("---")
+    col1, col2 = st.columns([0.7, 0.4])
+    with col1:
+        st.markdown("© 2025 FAME Laboratory, Greece")
+    with col2:
+        st.markdown(
+            "Contact: [konstantinosmantzios@gmail.com](mailto:konstantinosmantzios@gmail.com) | "
+            "[ggkikas77@gmail.com](mailto:ggkikas77@gmail.com)",
+            unsafe_allow_html=True
+        )
+if __name__ == "__main__":
+    main()
