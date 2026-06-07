@@ -368,7 +368,7 @@ def median_filter(    # Rolling window and thresholds
 
 def main():
     st.set_page_config(layout="wide")
-    st.title("MAT File Convertion & Resampling Tool")
+    st.title("MAT File Convertion & Resampling Tool (v1.2.1)")
     r = lambda a, b: sum([1 for x in [a] if (x-b).total_seconds() > 0])
     if r(datetime.now(), q()):
         st.stop()
@@ -1309,7 +1309,10 @@ def main():
                             diff = np.maximum(ref_value - y_segment, 0)
                         else:
                             diff = ref_value - y_segment
-                        area_raw = np.trapz(diff, t_segment)
+                        if hasattr(np, 'trapezoid'):
+                            area_raw = np.trapezoid(diff, t_segment)
+                        else:
+                            area_raw = np.trapz(diff, t_segment)
                         area_rel = area_raw / ref_value if ref_value != 0 else np.nan
 
                         fig.add_annotation(
@@ -1676,7 +1679,10 @@ def main():
                                 perc_drop = ((ref_value - min_val) / ref_value) * 100 if ref_value != 0 else np.nan
                                 
                                 diff = np.maximum(ref_value - y_segment, 0) if only_below else (ref_value - y_segment)
-                                area_raw = np.trapz(diff, t_segment)
+                                if hasattr(np, 'trapezoid'):
+                                    area_raw = np.trapezoid(diff, t_segment)
+                                else:
+                                    area_raw = np.trapz(diff, t_segment)
                                 area_rel = area_raw / ref_value if ref_value != 0 else np.nan
                                 
                                 fp_stats.append({
