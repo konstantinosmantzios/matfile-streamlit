@@ -236,7 +236,7 @@ def extract_channel_signals_with_comments(mat, df_comments):
     """Flatten and extract signal waveforms and align comment indicators."""
     titles = [str(t).strip() for t in mat["titles"]]
     df_channels = channel_info_df(mat)
-    data_flat = mat["data"].flatten()
+    data_flat = mat["data"].ravel()
     blocktimes = np.atleast_1d(mat["blocktimes"])
 
     EXCLUDE = {"Channel 24", "Channel 25", "Channel 26"}
