@@ -1,137 +1,51 @@
-# Standard Operating Procedure (SOP)  
-### Streamlit MAT File Conversion & Filtering Tool
+# LabChart Mat-File Analysis Tool
 
-&nbsp;  
-&nbsp;  
+A Streamlit-based web application developed for the FAME Laboratory, Greece, to analyze continuous physiological data (like Finger Pressure, CBF, MAP, Heart Rate) extracted from LabChart `.mat` files. 
 
-## 📌 Purpose of the Tool
-This tool converts physiological data stored in MATLAB `.mat` files into an easy-to-use format (Excel).  
-It also allows **filtering** and **resampling** of the signals so they can be cleaned, averaged, and better visualized.  
+This tool focuses on extracting and analyzing Supine-to-Standing cardiovascular transitions.
 
-The tool is designed for **students and researchers with little or no programming background**.  
-Everything happens through the **Streamlit web interface**:  
-- Upload a file  
-- Adjust a few settings  
-- Download clean Excel files  
+## Features
+- **Upload & Read:** Seamlessly upload `.mat` files (supporting both old-style and HDF5 v7.3 MATLAB formats) and extract signal channels dynamically.
+- **Data Filtering:** Clean raw physiological signals using interactive filters:
+    - Savitzky-Golay (Smoothing)
+    - Butterworth Low-Pass (Frequency filtering)
+    - Hampel Filter (Spike/Outlier removal)
+- **Interactive Visualization:** Explore the data with rich Plotly charts. You can zoom, pan, and hover to inspect values across the whole timeline.
+- **Supine to Standing Analysis:** 
+    - The algorithm automatically parses LabChart comments to find `transition` and `stand` markers.
+    - It extracts customizable "Baseline" segments before the transition.
+    - It highlights the physiological drop (Orange Phase) and the recovery/standing phase (Green Phase).
+- **Beat-Based & Time-Based Resampling:** Optionally resample the data using the natural peak intervals of the primary signal (e.g., peak-to-peak beat detection) to compute per-beat averages, instead of raw 1000Hz continuous data.
+- **Excel Report Generation:** Export a highly-formatted, multi-sheet `.xlsx` report that includes:
+    - The raw (filtered) data.
+    - The resampled/beat-based data.
+    - Extracted Transition Statistics (Drop %, Area Under/Over Curve, Min values).
+    - Headless plots capturing the exact visual snapshot of each transition test.
 
-&nbsp;  
+## Installation
 
+1. Clone or download this repository.
+2. Install the required dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-## ⚙️ How the Tool Works
-1. Upload a `.mat` file.  
-2. The tool automatically detects key signals:  
-   - **Finger Pressure**  
-   - **Cerebral Blood Flow (CBF)**  
-   - and other derived signals  
-3. Calibration phases in **Finapress** are automatically removed when possible.  
-4. Choose **filtering methods** for Finger Pressure and/or CBF to remove artifacts.  
-5. Resample the data:  
-   - **Time-based** (e.g., every 1 sec, 5 sec, 1 min)  
-   - **Beat-based** (e.g., 5 or 10 heartbeats)  
-6. Export the results into **Excel** with:  
-   - Timestamps  
-   - Elapsed time  
-   - Comments  
-   - Selected signals  
+## Usage
 
-&nbsp;  
+1. Open a terminal and navigate to the folder containing `app.py`.
+2. Run the Streamlit application:
+   ```bash
+   streamlit run app.py
+   ```
+3. A browser window will open automatically (typically at `http://localhost:8501`).
+4. Upload your `.mat` file from the sidebar and configure your parameters.
 
-## 🔎 Filtering Methods Explained
-Filtering is **optional**. If unsure, start with defaults.
+## Directory Structure
+- `app.py`: The main Streamlit web application.
+- `export.py`: Handles the automated backend Excel and Plot generation logic.
+- `requirements.txt`: Python package dependencies.
+- `readMatFile.py`: Helper script / older scripts (if applicable).
 
-### 1. No Filter
-- Leaves the signal exactly as recorded.  
-- Use this if you trust the raw data.
-
----
-
-### 2. Jump Filter  
-Removes sudden, unrealistic jumps in the signal caused by **sensor noise or movement**.  
-
-**a. Jump Threshold (size of change)**  
-- Defines how big a sudden change must be to count as an artifact.  
-- If the signal changes more than this threshold between two points, the point is flagged as invalid.  
-
-- Lower values → **more strict** (even small fluctuations removed).  
-- Higher values → **more tolerant** (only very large spikes removed).  
-
-**b. Close Jump Window (gap between jumps)**  
-- Looks at how close together multiple jumps are.  
-- If two jumps happen within this many samples, the **entire section between them is deleted**.  
-
-- Lower values → **narrow effect** (only the exact jumps removed).  
-- Higher values → **wider effect** (whole section between close jumps removed).  
-
-**Examples (at 200 Hz sampling):**  
-- 100 samples ≈ **0.5 sec** → removes very short noisy bursts.  
-- 500 samples ≈ **2.5 sec** → balanced (default).  
-- 1000 samples ≈ **5 sec** → aggressive, removes long sections if multiple jumps occur close together.  
-
----
-
-### 3. Median Filter (Advanced for CBF)  
-Suppresses small **spikes (upward)** or **dips (downward)** in the CBF signal while preserving the overall shape.  
-
-**Parameters:**  
-
-- **Median Window Length (smoothing strength)**  
-  - Defines how wide the averaging window is for smoothing.  
-  - Lower values → lighter smoothing (**keeps detail but leaves noise**).  
-  - Higher values → stronger smoothing (**removes noise but may blur sharp changes**).  
-
-- **Positive Spike Threshold (upward spikes)**  
-  - Defines strictness for suppressing sudden **upward spikes**.  
-  - Lower values → stricter (removes even small upward jumps).  
-  - Higher values → more tolerant (keeps detail, but large spikes may remain).  
-
-- **Negative Spike Threshold (downward dips)**  
-  - Defines strictness for suppressing sudden **downward dips**.  
-  - Lower values → stricter (removes even small dips).  
-  - Higher values → more tolerant (keeps detail, but some dips may remain).  
-
-&nbsp;  
-
-
-## 📉 Resampling Options
-Since raw signals are at **200 Hz** (very high frequency), you can reduce them into manageable summaries:  
-
-- **Time-based**: average signal every fixed interval (e.g., 1 sec, 10 sec, 1 min).  
-  *Useful for long recordings.*  
-
- - **Beat-based**: produces one row for **each detected beat** (separately for Finger Pressure and CBF).  
-   - Each channel keeps its own beat timing (Finapress and CBF beats do not align exactly).  
-   - For every beat, the value shown is the **mean of N beats centered around it**.  
-     Example:  
-     • With 5-beat smoothing → each data point is the average of the current beat plus the 2 beats before and the 2 beats after.  
-     • With 10-beat smoothing → each data point is the average of the current beat plus the 4 beats before and the 4 beats after.  
-   - This avoids the lag effect of using only previous beats and gives a more balanced, real-time representation.  
-   *Useful for comparing cardiac cycles directly while accounting for natural timing differences.*  
-
-![Example of 5-beat smoothing](images/5beat_example.png)
-
-⚠️ **Important**: Comments are preserved at their exact time, even if no other data is present.  
-
-&nbsp;  
-
-## 📂 Exported Excel Sheets
-- **Filtered(200Hz)**  
-  - Original signals at high resolution (200 Hz).  
-  - Includes applied filters and comments.  
-
-- **Resampled (Time or Beats)**  
-  - Cleaner, downsampled signals for easier analysis.  
-  - Includes timestamps, elapsed time, comments, and all selected signals.  
-
-&nbsp;  
-
-## 👩‍💻 Notes for Non-Experts
-- If you are not sure which filter to use, **start with defaults**.  
-- Use **No Filter** if the raw data seem clean (no obvious outliers or noise).  
-- Use **Jump Filter** if you see unrealistic jumps or spikes.  
-- Use **Median Filter** for CBF if there is high-frequency noise or small sharp spikes/dips.
-&nbsp;  
-&nbsp;  
-&nbsp;  
-&nbsp; 
-&nbsp;  
-&nbsp;  
+## Contact / Authors
+© 2026 FAME Laboratory, Greece.
+Contact: K. Mantzios | G. Gkikas

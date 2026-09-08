@@ -1,6 +1,8 @@
-numpy
-pandas
-scipy
 streamlit
+pandas
+numpy
 plotly
+scipy
+h5py
 xlsxwriter
+matplotlib
