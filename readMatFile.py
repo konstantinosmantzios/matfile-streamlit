@@ -424,25 +424,30 @@ if uploaded_mat:
             resampled_t = st.session_state.result_df['absolute_time'].values
             resampled_y = st.session_state.result_df[plot_signal].values
             
+        # Downsample for Plotly visualization to avoid out-of-memory errors on Streamlit Cloud
+        max_plot_pts = 20000
+        step_raw = len(raw_t) // max_plot_pts if len(raw_t) > max_plot_pts else 1
+        step_res = len(resampled_t) // max_plot_pts if len(resampled_t) > max_plot_pts else 1
+        
         fig = go.Figure()
         
         # Plot Raw Trace (Background)
         fig.add_trace(go.Scatter(
-            x=raw_t, y=raw_y, mode='lines', name='Raw Data (Unfiltered)',
+            x=raw_t[::step_raw], y=raw_y[::step_raw], mode='lines', name='Raw Data (Unfiltered)',
             line=dict(color='rgba(156,163,175,0.4)', width=1),
             visible=raw_vis
         ))
         
         # Plot Filtered Trace (Foreground)
         fig.add_trace(go.Scatter(
-            x=raw_t, y=filt_y, mode='lines', name='Filtered Data',
+            x=raw_t[::step_raw], y=filt_y[::step_raw], mode='lines', name='Filtered Data',
             line=dict(color='#38bdf8', width=1),
             visible=filt_vis
         ))
         
         # Plot Resampled Trace
         fig.add_trace(go.Scatter(
-            x=resampled_t, y=resampled_y, mode='lines', name=f'Resampled ({resampled_label})',
+            x=resampled_t[::step_res], y=resampled_y[::step_res], mode='lines', name=f'Resampled ({resampled_label})',
             line=dict(color='#f97316', width=2)
         ))
         
