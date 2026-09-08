@@ -375,11 +375,11 @@ if uploaded_mat:
         
         col1, col2 = st.columns([2, 1])
         with col1:
-            viz_mode = st.radio("Visualization Mode", ["Filtering Preview", "Standing to Supine Analysis"], index=1, horizontal=True, key="viz_mode")
+            viz_mode = st.radio("Visualization Mode", ["Filtering Preview", "Supine to Standing Analysis"], index=1, horizontal=True, key="viz_mode")
         with col2:
             show_comments = st.checkbox("Show Comments", value=True, key="show_comments")
             
-        if viz_mode == "Standing to Supine Analysis":
+        if viz_mode == "Supine to Standing Analysis":
             with st.expander("Analysis Settings", expanded=True):
                 col_a, col_b, col_c = st.columns(3)
                 with col_a:
@@ -402,7 +402,7 @@ if uploaded_mat:
             raw_vis = True
             filt_vis = True
             peak_vis = True
-        else: # "Standing to Supine Analysis"
+        else: # "Supine to Standing Analysis"
             raw_vis = 'legendonly'
             filt_vis = 'legendonly'
             peak_vis = 'legendonly'
@@ -432,7 +432,7 @@ if uploaded_mat:
         fig = go.Figure()
         
         # Plot Raw Trace (Background)
-        fig.add_trace(go.Scatter(
+        fig.add_trace(go.Scattergl(
             x=raw_t, y=raw_y, mode='lines', name='Raw Data (Unfiltered)',
             # x=raw_t[::step_raw], y=raw_y[::step_raw], mode='lines', name='Raw Data (Unfiltered)',
 
@@ -441,7 +441,7 @@ if uploaded_mat:
         ))
         
         # Plot Filtered Trace (Foreground)
-        fig.add_trace(go.Scatter(
+        fig.add_trace(go.Scattergl(
             x=raw_t, y=filt_y, mode='lines', name='Filtered Data',
             # x=raw_t[::step_raw], y=filt_y[::step_raw], mode='lines', name='Filtered Data',
 
@@ -450,7 +450,7 @@ if uploaded_mat:
         ))
         
         # Plot Resampled Trace
-        fig.add_trace(go.Scatter(
+        fig.add_trace(go.Scattergl(
             x=resampled_t, y=resampled_y, mode='lines', name=f'Resampled ({resampled_label})',  
             # x=resampled_t[::step_res], y=resampled_y[::step_res], mode='lines', name=f'Resampled ({resampled_label})',
 
@@ -463,7 +463,7 @@ if uploaded_mat:
                 peaks_to_plot = st.session_state.peaks_idx_cbf if (plot_signal == fallback_signal and st.session_state.peaks_idx_cbf.size > 0) else st.session_state.peaks_idx
                 peaks_to_plot = peaks_to_plot[(peaks_to_plot >= 0) & (peaks_to_plot < len(raw_x))]
                 if peaks_to_plot.size > 0:
-                    fig.add_trace(go.Scatter(
+                    fig.add_trace(go.Scattergl(
                         x=raw_t[peaks_to_plot], 
                         y=filt_y[peaks_to_plot],
                         mode='markers', 
@@ -478,8 +478,8 @@ if uploaded_mat:
             if not comments_data.empty:
                 comment_list = comments_data[['time_s', 'absolute_time', 'comment']].to_dict('records')
 
-                # Full transition analysis only in Standing to Supine mode
-                if viz_mode == "Standing to Supine Analysis":
+                # Full transition analysis only in Supine to Standing mode
+                if viz_mode == "Supine to Standing Analysis":
                     i = 0
                     while i < len(comment_list):
                         c1 = comment_list[i]
@@ -723,7 +723,7 @@ if uploaded_mat:
         # Compute domains and total height
         total_height = plot_height
         table_height = 360  # Fixed height in px for the table annotations
-        if viz_mode == "Standing to Supine Analysis":
+        if viz_mode == "Supine to Standing Analysis":
             total_height += table_height
             table_frac = table_height / total_height
             main_domain = [0, max(0.1, 1 - table_frac - 0.02)]
@@ -787,7 +787,7 @@ if uploaded_mat:
             st.table(pd.DataFrame(definitions_data))
         
         # --- EXCEL EXPORT ---
-        if viz_mode == "Standing to Supine Analysis":
+        if viz_mode == "Supine to Standing Analysis":
             st.markdown("### Export Analysis")
             st.write("Generate an Excel report containing all filtered data, resampled data, metadata, and transition statistics.")
             

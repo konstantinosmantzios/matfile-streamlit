@@ -271,8 +271,8 @@ def extract_channel_signals_with_comments(mat, df_comments):
     total_len = sum(block_lengths)
     block_offsets = np.cumsum([0] + block_lengths[:-1])
 
-    df = pd.DataFrame({name: np.round(sig[:total_len], 2) for name, sig in signals.items()})
-    time_s = np.arange(total_len, dtype=float) / sr_ref
+    df = pd.DataFrame({name: np.round(sig[:total_len], 2).astype(np.float32) for name, sig in signals.items()})
+    time_s = (np.arange(total_len) / sr_ref).astype(np.float32)
     df.insert(0, "time_s", time_s)
 
     # Reconstruct exact datetime array
@@ -289,7 +289,7 @@ def extract_channel_signals_with_comments(mat, df_comments):
     df.insert(1, "absolute_time", abs_time)
     df.insert(2, "time_mmss_millis", [sec_to_mmss_millis(t) for t in time_s])
     
-    block_id_col = np.empty(total_len, dtype=int)
+    block_id_col = np.empty(total_len, dtype=np.int16)
     write_pos = 0
     for b, Lb in enumerate(block_lengths):
         if Lb <= 0: continue
