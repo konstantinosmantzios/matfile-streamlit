@@ -191,7 +191,13 @@ def generate_excel_report(df_filtered, df_resampled, metadata_dict, stats_list, 
             
             # Auto-adjust column width
             for i, col in enumerate(df_out.columns):
-                max_len = max(df_out[col].astype(str).map(len).max() if not df_out[col].empty else 0, len(str(col))) + 4
+                col_data = df_out.iloc[:, i].dropna()
+                if not col_data.empty:
+                    max_data_len = col_data.map(lambda x: len(str(x))).max()
+                    max_data_len = int(max_data_len) if pd.notna(max_data_len) else 0
+                else:
+                    max_data_len = 0
+                max_len = max(max_data_len, len(str(col))) + 4
                 worksheet.set_column(i, i, min(max_len, 70))
         
         # 1. Filtered Data
