@@ -52,8 +52,8 @@ def extract_stats_for_signal(sig_name, resampled_x, resampled_y, comment_list, b
                         y_val_or = y_area[valid_mask]
                         
                         if len(x_val_or) > 1:
-                            area_above_or = np.trapz(np.maximum(y_val_or - upper_y, 0), x_val_or)
-                            area_below_or = np.trapz(np.maximum(upper_y - y_val_or, 0), x_val_or)
+                            area_above_or = np.trapezoid(np.maximum(y_val_or - upper_y, 0), x_val_or)
+                            area_below_or = np.trapezoid(np.maximum(upper_y - y_val_or, 0), x_val_or)
                             min_val_or = float(np.min(y_val_or))
                             if upper_y != 0:
                                 pct_drop_or = (upper_y - min_val_or) / abs(upper_y) * 100
@@ -74,8 +74,8 @@ def extract_stats_for_signal(sig_name, resampled_x, resampled_y, comment_list, b
                         y_val_gr = y_area_green[valid_mask_gr]
                         
                         if len(x_val_gr) > 1:
-                            area_above_gr = np.trapz(np.maximum(y_val_gr - upper_y_green, 0), x_val_gr)
-                            area_below_gr = np.trapz(np.maximum(upper_y_green - y_val_gr, 0), x_val_gr)
+                            area_above_gr = np.trapezoid(np.maximum(y_val_gr - upper_y_green, 0), x_val_gr)
+                            area_below_gr = np.trapezoid(np.maximum(upper_y_green - y_val_gr, 0), x_val_gr)
                             min_val_gr = float(np.min(y_val_gr))
                             if upper_y_green != 0:
                                 pct_drop_gr = (upper_y_green - min_val_gr) / abs(upper_y_green) * 100
