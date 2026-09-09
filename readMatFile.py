@@ -4,6 +4,7 @@ import scipy.io
 import streamlit as st
 import plotly.graph_objects as go
 from export import generate_excel_report, extract_stats_for_signal
+import io
 import os
 from datetime import datetime, timedelta
 
@@ -28,6 +29,214 @@ from processing import (
 )
 
 # ---------------------------------------------------------
+# Cached Data Loading & Processing Functions
+# ---------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def load_mat_file(file_bytes: bytes):
+    """Load and parse a MAT file once per upload. Results cached by file content hash."""
+    mat = scipy.io.loadmat(io.BytesIO(file_bytes), squeeze_me=True)
+    df_ci = channel_info_df(mat)
+    df_com = comments_df(mat, df_ci)
+    df_extracted = extract_channel_signals_with_comments(mat, df_com)
+    n_blks = int(len(np.atleast_1d(mat["blocktimes"])))
+    return df_ci, df_com, df_extracted, n_blks
+
+
+@st.cache_data(show_spinner=False)
+def compute_processed_signals(
+    df: pd.DataFrame,
+    all_signals: tuple,
+    priority_signal: str,
+    fallback_signal: str,
+    main_signal: str,
+    auto_cal_option: str,
+    use_channel_masking: bool,
+    autocal_col,
+    df_comments: pd.DataFrame,
+    df_channel_info: pd.DataFrame,
+    n_blocks: int,
+    filter_method_fp: str,
+    fp_savgol_win: int, fp_savgol_poly: int,
+    fp_butter_cutoff: float, fp_butter_order: int,
+    fp_hampel_win: int, fp_hampel_sig: float,
+    filter_method_cbf: str,
+    cbf_savgol_win: int, cbf_savgol_poly: int,
+    cbf_butter_cutoff: float, cbf_butter_order: int,
+    cbf_hampel_win: int, cbf_hampel_sig: float,
+    beat_mode: bool,
+    beats_k: int,
+    bin_sec: float,
+):
+    """Apply filters and resampling. Cached: only re-runs when filter/resample params change."""
+    all_signals_list = list(all_signals)
+    df_raw = df.sort_values('time_s').copy()
+    df_sorted = df.sort_values('time_s').copy()
+
+    # --- APPLY AUTOCAL MASK ---
+    mask = np.zeros(len(df_sorted), dtype=bool)
+    if use_channel_masking and autocal_col is not None:
+        try:
+            temp_col = pd.to_numeric(df_sorted[autocal_col], errors='coerce')
+            # When AutoCal is ON, we ALWAYS mask when it is near 0.
+            mask = temp_col < 0.5
+        except Exception:
+            mask = (df_sorted[autocal_col] == 0) | (df_sorted[autocal_col] == False)
+    else:
+        # When AutoCal is OFF, rely on HCU comments and mask until the next spike (temp_col >= 0.5)
+        if df_comments is not None and not df_comments.empty and autocal_col is not None:
+            block_lengths = []
+            for _, row in df_channel_info.iterrows():
+                if row["title"] == autocal_col and row.get("datastart") is not None:
+                    block_lengths = [int(e - s + 1) for s, e in zip(row["datastart"], row["dataend"])]
+                    break
+            if not block_lengths:
+                block_lengths = [len(df_sorted) // n_blocks] * n_blocks
+            block_offsets = np.cumsum([0] + block_lengths[:-1])
+
+            matches = df_comments[df_comments["comment_text"] == "HCU not connected"]
+            temp_col = pd.to_numeric(df_sorted[autocal_col], errors='coerce').fillna(0)
+            is_spike = (temp_col >= 0.5).values
+
+            for _, ev in matches.iterrows():
+                block_index = int(ev["block_index"]) - 1
+                sample_index = int(ev["sample_index"])
+                if 0 <= block_index < len(block_offsets):
+                    idx_global = block_offsets[block_index] + sample_index
+                    future_spikes = np.where(is_spike[idx_global:])[0]
+                    if len(future_spikes) > 0:
+                        end_idx = idx_global + future_spikes[0]
+                        mask[idx_global:end_idx] = True
+                    else:
+                        fs_fb = float(df_channel_info[df_channel_info["title"] == all_signals_list[0]]["samplerate"].iloc[0]) if not df_channel_info.empty else 1000.0
+                        end_idx = min(len(df_sorted), idx_global + int(15 * fs_fb))
+                        mask[idx_global:end_idx] = True
+
+    # --- APPLY NUMERIC CONVERSION & AUTOCAL MASK TO SIGNALS ---
+    for col in all_signals_list:
+        if col != fallback_signal and col != autocal_col:
+            df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce').astype('float64')
+            # Only apply the autocal masking to the Finger Pressure signal
+            if col == priority_signal:
+                df_sorted.loc[mask, col] = np.nan
+
+    for bp_col in ["2: MAP", "3: Systolic", "4: Diastolic"]:
+        if bp_col in df_sorted.columns:
+            df_sorted[bp_col] = df_sorted[bp_col].replace(0, np.nan)
+
+    # --- APPLY FINGER PRESSURE FILTER ---
+    if main_signal == priority_signal:
+        df_sorted[main_signal] = pd.to_numeric(df_sorted[main_signal], errors='coerce').astype('float64')
+        fs = float(df_channel_info[df_channel_info["title"] == main_signal]["samplerate"].iloc[0]) if not df_channel_info[df_channel_info["title"] == main_signal].empty else 1000.0
+        if filter_method_fp == "Savitzky-Golay":
+            df_sorted[main_signal] = apply_savgol_filter(df_sorted[main_signal].values, window_length=fp_savgol_win, polyorder=fp_savgol_poly)
+        elif filter_method_fp == "Butterworth Low-Pass":
+            df_sorted[main_signal] = apply_butter_lowpass(df_sorted[main_signal].values, cutoff_freq=fp_butter_cutoff, fs=fs, order=fp_butter_order)
+        elif filter_method_fp == "Hampel (Outlier Removal)":
+            df_sorted[main_signal] = apply_hampel_filter(df_sorted[main_signal].values, window_size=fp_hampel_win, n_sigmas=fp_hampel_sig)
+
+    # --- APPLY CBF FILTER ---
+    if fallback_signal in all_signals_list:
+        df_sorted[fallback_signal] = pd.to_numeric(df_sorted[fallback_signal], errors='coerce').astype('float64')
+        fs_cbf = float(df_channel_info[df_channel_info["title"] == fallback_signal]["samplerate"].iloc[0]) if not df_channel_info[df_channel_info["title"] == fallback_signal].empty else 1000.0
+        if filter_method_cbf == "Savitzky-Golay":
+            df_sorted[fallback_signal] = apply_savgol_filter(df_sorted[fallback_signal].values, window_length=cbf_savgol_win, polyorder=cbf_savgol_poly)
+        elif filter_method_cbf == "Butterworth Low-Pass":
+            df_sorted[fallback_signal] = apply_butter_lowpass(df_sorted[fallback_signal].values, cutoff_freq=cbf_butter_cutoff, fs=fs_cbf, order=cbf_butter_order)
+        elif filter_method_cbf == "Hampel (Outlier Removal)":
+            df_sorted[fallback_signal] = apply_hampel_filter(df_sorted[fallback_signal].values, window_size=cbf_hampel_win, n_sigmas=cbf_hampel_sig)
+
+    # Ensure all signals are float64 before resampling
+    for col in all_signals_list:
+        df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce').astype('float64')
+
+    # --- RESAMPLING ---
+    result_df = None
+    agg5_moving_map = None
+    peaks = np.array([], dtype=int)
+    peaks_cbf = np.array([], dtype=int)
+
+    if not beat_mode:
+        # Time-based resampling
+        df_tmp = df_sorted.copy()
+        t0 = float(df_tmp['time_s'].iloc[0]) if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any() else 0.0
+        df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
+        result_df = df_tmp.groupby('time_bin').agg(
+            {**{c: 'mean' for c in all_signals_list},
+             'absolute_time': 'first',
+             'time_s': 'first',
+             'time_mmss_millis': 'first',
+             'comment': first_nonempty_comment}
+        ).reset_index(drop=True)
+    else:
+        # Dynamic beat-based resampling
+        ts = df_sorted['time_s'].values
+        fs0 = 1.0 / float(np.nanmedian(np.diff(ts))) if len(ts) > 1 else 200.0
+
+        sig0_raw = pd.to_numeric(df_sorted[main_signal], errors='coerce').astype('float64').values
+        sig0_filt = rolling_median_np(sig0_raw, window=5)
+
+        hr = pd.to_numeric(df_sorted["5: HR"], errors='coerce').astype('float64').values if "5: HR" in df_sorted.columns else np.full_like(sig0_filt, 60.0)
+        hr_for_win = prepare_hr_for_window(hr.copy(), roll_win=1000)
+        hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
+        win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=1.3, min_samples=3)
+
+        agg5_moving_map = {sig_name: np.full(len(df_sorted), np.nan, dtype=float) for sig_name in all_signals_list}
+
+        if "block_index" not in df_sorted.columns:
+            df_sorted["block_index"] = 0
+        block_ids = df_sorted["block_index"].values
+        unique_blocks = np.unique(block_ids)
+
+        for b_id in unique_blocks:
+            b_mask = (block_ids == b_id)
+            b_indices = np.where(b_mask)[0]
+            if len(b_indices) == 0:
+                continue
+
+            b_offset = b_indices[0]
+            sig0_b = sig0_filt[b_mask]
+            win_half_b = win_half[b_mask]
+
+            p_b = find_local_high_indices(sig0_b, win_half_b)
+            if len(p_b) > 0:
+                peaks = np.concatenate([peaks, p_b + b_offset])
+
+            if fallback_signal in all_signals_list:
+                sig_cbf_b = rolling_median_np(pd.to_numeric(df_sorted[fallback_signal].values[b_mask], errors='coerce').astype('float64'), window=5)
+                p_cbf_b = find_local_high_indices(sig_cbf_b, win_half_b)
+                if len(p_cbf_b) > 0:
+                    peaks_cbf = np.concatenate([peaks_cbf, p_cbf_b + b_offset])
+            else:
+                p_cbf_b = np.array([], dtype=int)
+
+            for sig_name in all_signals_list:
+                y_b = pd.to_numeric(df_sorted[sig_name].values[b_mask], errors='coerce').astype('float64')
+                peaks_used = p_cbf_b if (sig_name == fallback_signal and p_cbf_b.size > 0) else p_b
+
+                agg_m_b = np.full(len(y_b), np.nan, dtype=float)
+                if peaks_used.size >= beats_k:
+                    nP = peaks_used.size
+                    mids_used = np.rint((peaks_used[:-1] + peaks_used[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
+                    half_k = beats_k // 2
+                    for i in range(half_k, nP - (beats_k - half_k - 1)):
+                        i0, i1 = peaks_used[i - half_k], peaks_used[i + (beats_k - half_k - 1)]
+                        seg_vals = y_b[i0:i1 + 1]
+                        mval = np.nan if np.isnan(seg_vals).all() else float(np.nanmean(seg_vals))
+                        seg_start = 0 if i == 0 else int(mids_used[i - 1])
+                        seg_end = len(y_b) if i == (nP - 1) else int(mids_used[i])
+                        agg_m_b[seg_start:seg_end] = mval
+
+                # Set the last sample of the block to NaN to break Plotly lines across huge gaps
+                if b_id != unique_blocks[-1] and len(agg_m_b) > 0:
+                    agg_m_b[-1] = np.nan
+
+                agg5_moving_map[sig_name][b_mask] = agg_m_b
+
+    return df_raw, df_sorted, result_df, agg5_moving_map, peaks, peaks_cbf
+
+
+# ---------------------------------------------------------
 # Streamlit Interface Layout
 # ---------------------------------------------------------
 
@@ -45,12 +254,11 @@ if uploaded_mat is not None:
         st.rerun()
 
 if uploaded_mat:
-    mat = scipy.io.loadmat(uploaded_mat, squeeze_me=True)
-    df_channel_info = channel_info_df(mat)
-    df_comments = comments_df(mat, df_channel_info)
-    df = extract_channel_signals_with_comments(mat, df_comments)
+    _file_bytes = uploaded_mat.read()
+    with st.spinner("Loading MAT file..."):
+        df_channel_info, df_comments, df, n_blocks = load_mat_file(_file_bytes)
     all_columns = list(df.columns)
-    
+
     st.session_state.df_comments = df_comments
 
     priority_signal = '1: Finger Pressure'
@@ -162,213 +370,68 @@ if uploaded_mat:
         cbf_hampel_win = st.sidebar.slider("Rolling Window Size [CBF]", 3, 50, 5, key="cbf_hampel_win", help="Number of neighbors on each side to compute median.")
         cbf_hampel_sig = st.sidebar.slider("Sigma Threshold [CBF]", 1.0, 10.0, 3.0, step=0.5, key="cbf_hampel_sig", help="Number of standard deviations to classify an outlier.")
     
-    if True:
-        if True:
-            with st.spinner("Processing & resampling signal vectors..."):
-                # Save Raw DF for Visualization Background
-                st.session_state.df_raw = df.sort_values('time_s').copy()
-                
-                # Copy df to process it
-                df_sorted = df.sort_values('time_s').copy()
-                
-                # --- APPLY FILTERS ---
-                autocal_col = find_autocal_column(df_sorted)
-                mask = np.zeros(len(df_sorted), dtype=bool)
-                
-                use_channel_masking = False
-                if auto_cal_option == "Force Enabled (Channel)":
+        # ----- AutoCal detection (outside cache so sidebar messages always display) -----
+        _df_for_detection = df.sort_values('time_s')
+        autocal_col = find_autocal_column(_df_for_detection)
+        use_channel_masking = False
+        if auto_cal_option == "Force Enabled (Channel)":
+            use_channel_masking = True
+            st.sidebar.info("AutoCal mask manually enabled.")
+        elif auto_cal_option == "Auto-Detect" and autocal_col is not None:
+            try:
+                _temp_detect = pd.to_numeric(_df_for_detection[autocal_col], errors='coerce')
+                _perc_below = (_temp_detect < 0.5).mean()
+                if _perc_below > 0.95:
+                    use_channel_masking = False
+                    st.sidebar.info(f"Auto-Detect: AutoCal was OFF ({_perc_below*100:.1f}% resting). Relying on comments only.")
+                else:
                     use_channel_masking = True
-                    st.sidebar.info("AutoCal mask manually enabled.")
-                elif auto_cal_option == "Auto-Detect":
-                    try:
-                        temp_col = pd.to_numeric(df_sorted[autocal_col], errors='coerce')
-                        perc_below_05 = (temp_col < 0.5).mean()
-                        if perc_below_05 > 0.95:
-                            use_channel_masking = False
-                            st.sidebar.info(f"Auto-Detect: AutoCal was OFF ({perc_below_05*100:.1f}% resting). Relying on comments only.")
-                        else:
-                            use_channel_masking = True
-                            st.sidebar.success(f"Auto-Detect: AutoCal was ON ({perc_below_05*100:.1f}% active noise). Using precision signal masking.")
-                    except Exception as e:
-                        use_channel_masking = False
+                    st.sidebar.success(f"Auto-Detect: AutoCal was ON ({_perc_below*100:.1f}% active noise). Using precision signal masking.")
+            except Exception:
+                use_channel_masking = False
 
-                if use_channel_masking and autocal_col is not None:
-                    try:
-                        temp_col = pd.to_numeric(df_sorted[autocal_col], errors='coerce')
-                        # When AutoCal is ON, we ALWAYS mask when it is near 0.
-                        mask = temp_col < 0.5
-                    except Exception:
-                        mask = (df_sorted[autocal_col] == 0) | (df_sorted[autocal_col] == False)
-                else:
-                    # When AutoCal is OFF, rely on HCU comments and mask until the next spike (temp_col >= 0.5)
-                    if df_comments is not None and not df_comments.empty and autocal_col is not None:
-                        n_blocks = len(mat["blocktimes"])
-                        block_lengths = []
-                        for _, row in df_channel_info.iterrows():
-                            if row["title"] == autocal_col and row.get("datastart") is not None:
-                                block_lengths = [int(e-s+1) for s, e in zip(row["datastart"], row["dataend"])]
-                                break
-                        if not block_lengths:
-                            block_lengths = [len(df_sorted) // n_blocks] * n_blocks
-                        block_offsets = np.cumsum([0] + block_lengths[:-1])
-                        
-                        matches = df_comments[df_comments["comment_text"] == "HCU not connected"]
-                        temp_col = pd.to_numeric(df_sorted[autocal_col], errors='coerce').fillna(0)
-                        is_spike = (temp_col >= 0.5).values
-                        
-                        for _, ev in matches.iterrows():
-                            block_index = int(ev["block_index"]) - 1
-                            sample_index = int(ev["sample_index"])
-                            if 0 <= block_index < len(block_offsets):
-                                idx_global = block_offsets[block_index] + sample_index
-                                future_spikes = np.where(is_spike[idx_global:])[0]
-                                if len(future_spikes) > 0:
-                                    end_idx = idx_global + future_spikes[0]
-                                    if isinstance(mask, pd.Series):
-                                        mask.iloc[idx_global:end_idx] = True
-                                    else:
-                                        mask[idx_global:end_idx] = True
-                                else:
-                                    fs = float(df_channel_info[df_channel_info["title"] == all_signals[0]]["samplerate"].iloc[0]) if not df_channel_info.empty else 1000.0
-                                    end_idx = min(len(df_sorted), idx_global + int(15 * fs))
-                                    if isinstance(mask, pd.Series):
-                                        mask.iloc[idx_global:end_idx] = True
-                                    else:
-                                        mask[idx_global:end_idx] = True
-                    
-                for col in all_signals:
-                    if col != fallback_signal and col != autocal_col:
-                        df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce').astype('float64')
-                        # Only apply the autocal masking to the Finger Pressure signal
-                        if col == priority_signal:
-                            df_sorted.loc[mask, col] = np.nan
-                        
-                for bp_col in ["2: MAP", "3: Systolic", "4: Diastolic"]:
-                    if bp_col in df_sorted.columns:
-                        df_sorted[bp_col] = df_sorted[bp_col].replace(0, np.nan)
-                        
-                # Apply Finger Pressure filter Sandbox
-                if main_signal == priority_signal:
-                    df_sorted[main_signal] = pd.to_numeric(df_sorted[main_signal], errors='coerce').astype('float64')
-                    fs = float(df_channel_info[df_channel_info["title"] == main_signal]["samplerate"].iloc[0]) if not df_channel_info[df_channel_info["title"] == main_signal].empty else 1000.0
-                    
-                    if filter_method_fp == "Savitzky-Golay":
-                        df_sorted[main_signal] = apply_savgol_filter(df_sorted[main_signal].values, window_length=fp_savgol_win, polyorder=fp_savgol_poly)
-                    elif filter_method_fp == "Butterworth Low-Pass":
-                        df_sorted[main_signal] = apply_butter_lowpass(df_sorted[main_signal].values, cutoff_freq=fp_butter_cutoff, fs=fs, order=fp_butter_order)
-                    elif filter_method_fp == "Hampel (Outlier Removal)":
-                        df_sorted[main_signal] = apply_hampel_filter(df_sorted[main_signal].values, window_size=fp_hampel_win, n_sigmas=fp_hampel_sig)
-                        
-                # Apply CBF filter
-                if fallback_signal in all_signals:
-                    df_sorted[fallback_signal] = pd.to_numeric(df_sorted[fallback_signal], errors='coerce').astype('float64')
-                    fs_cbf = float(df_channel_info[df_channel_info["title"] == fallback_signal]["samplerate"].iloc[0]) if not df_channel_info[df_channel_info["title"] == fallback_signal].empty else 1000.0
-                    
-                    if filter_method_cbf == "Savitzky-Golay":
-                        df_sorted[fallback_signal] = apply_savgol_filter(df_sorted[fallback_signal].values, window_length=cbf_savgol_win, polyorder=cbf_savgol_poly)
-                    elif filter_method_cbf == "Butterworth Low-Pass":
-                        df_sorted[fallback_signal] = apply_butter_lowpass(df_sorted[fallback_signal].values, cutoff_freq=cbf_butter_cutoff, fs=fs_cbf, order=cbf_butter_order)
-                    elif filter_method_cbf == "Hampel (Outlier Removal)":
-                        df_sorted[fallback_signal] = apply_hampel_filter(df_sorted[fallback_signal].values, window_size=cbf_hampel_win, n_sigmas=cbf_hampel_sig)
-                # --- END FILTERS ---
-                
-                # Make sure numeric types are correct for all remaining signals before resampling
-                for col in all_signals:
-                    df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce').astype('float64')
+        # Compute bin_sec for time-based mode (unused in beat mode)
+        bin_sec = float(bin_map.get(bin_choice, 1)) if not beat_mode else 0.0
 
-                if not beat_mode:
-                    # Time-based resampling
-                    selected_label = st.session_state.get('bin_choice_label', '1 sec')
-                    bin_sec = float(bin_map.get(selected_label, 1))
-                    
-                    df_tmp = df_sorted.copy()
-                    t0 = float(df_tmp['time_s'].iloc[0]) if len(df_tmp) > 0 and np.isfinite(df_tmp['time_s']).any() else 0.0
-                    df_tmp['time_bin'] = ((df_tmp['time_s'] - t0) // bin_sec).astype(int)
-                    
-                    result_df = df_tmp.groupby('time_bin').agg(
-                        {**{c: 'mean' for c in all_signals},
-                         'absolute_time': 'first',
-                         'time_s': 'first',
-                         'time_mmss_millis': 'first',
-                         'comment': first_nonempty_comment}
-                    ).reset_index(drop=True)
-                    
-                    st.session_state.df = df_sorted
-                    st.session_state.result_df = result_df
-                    st.session_state.all_signals = all_signals
-                    st.session_state.beat_mode = False
-                else:
-                    # Dynamic beat-based resampling
-                    ts = df_sorted['time_s'].values
-                    fs0 = 1.0 / float(np.nanmedian(np.diff(ts))) if len(ts) > 1 else 200.0
-                    
-                    sig0_raw = pd.to_numeric(df_sorted[main_signal], errors='coerce').astype('float64').values
-                    sig0_filt = rolling_median_np(sig0_raw, window=5)
-                    
-                    hr = pd.to_numeric(df_sorted["5: HR"], errors='coerce').astype('float64').values if "5: HR" in df_sorted.columns else np.full_like(sig0_filt, 60.0)
-                    hr_for_win = prepare_hr_for_window(hr.copy(), roll_win=1000)
-                    hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
-                    win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=1.3, min_samples=3)
-                    
-                    peaks = np.array([], dtype=int)
-                    peaks_cbf = np.array([], dtype=int)
-                    agg5_moving_map = {sig_name: np.full(len(df_sorted), np.nan, dtype=float) for sig_name in all_signals}
-                    
-                    if "block_index" not in df_sorted.columns:
-                        df_sorted["block_index"] = 0
-                    block_ids = df_sorted["block_index"].values
-                    unique_blocks = np.unique(block_ids)
-                    
-                    for b_id in unique_blocks:
-                        b_mask = (block_ids == b_id)
-                        b_indices = np.where(b_mask)[0]
-                        if len(b_indices) == 0: continue
-                        
-                        b_offset = b_indices[0]
-                        sig0_b = sig0_filt[b_mask]
-                        win_half_b = win_half[b_mask]
-                        
-                        p_b = find_local_high_indices(sig0_b, win_half_b)
-                        if len(p_b) > 0:
-                            peaks = np.concatenate([peaks, p_b + b_offset])
-                            
-                        if fallback_signal in all_signals:
-                            sig_cbf_b = rolling_median_np(pd.to_numeric(df_sorted[fallback_signal].values[b_mask], errors='coerce').astype('float64'), window=5)
-                            p_cbf_b = find_local_high_indices(sig_cbf_b, win_half_b)
-                            if len(p_cbf_b) > 0:
-                                peaks_cbf = np.concatenate([peaks_cbf, p_cbf_b + b_offset])
-                        else:
-                            p_cbf_b = np.array([], dtype=int)
-                            
-                        for sig_name in all_signals:
-                            y_b = pd.to_numeric(df_sorted[sig_name].values[b_mask], errors='coerce').astype('float64')
-                            peaks_used = p_cbf_b if (sig_name == fallback_signal and p_cbf_b.size > 0) else p_b
-                            
-                            agg_m_b = np.full(len(y_b), np.nan, dtype=float)
-                            if peaks_used.size >= beats_k:
-                                nP = peaks_used.size
-                                mids_used = np.rint((peaks_used[:-1] + peaks_used[1:]) / 2.0).astype(int) if nP > 1 else np.array([], dtype=int)
-                                half_k = beats_k // 2
-                                for i in range(half_k, nP - (beats_k - half_k - 1)):
-                                    i0, i1 = peaks_used[i - half_k], peaks_used[i + (beats_k - half_k - 1)]
-                                    seg_vals = y_b[i0:i1+1]
-                                    mval = np.nan if np.isnan(seg_vals).all() else float(np.nanmean(seg_vals))
-                                    seg_start = 0 if i == 0 else int(mids_used[i - 1])
-                                    seg_end = len(y_b) if i == (nP - 1) else int(mids_used[i])
-                                    agg_m_b[seg_start:seg_end] = mval
-                                    
-                            # Set the last sample of the block to NaN to break Plotly lines across huge gaps
-                            if b_id != unique_blocks[-1] and len(agg_m_b) > 0:
-                                agg_m_b[-1] = np.nan
-                                
-                            agg5_moving_map[sig_name][b_mask] = agg_m_b
+        # ----- Cached processing: filters + resampling -----
+        with st.spinner("Processing & resampling signal vectors..."):
+            df_raw, df_filtered, result_df, agg5_moving_map, peaks, peaks_cbf = compute_processed_signals(
+                df=df,
+                all_signals=tuple(all_signals),
+                priority_signal=priority_signal,
+                fallback_signal=fallback_signal,
+                main_signal=main_signal,
+                auto_cal_option=auto_cal_option,
+                use_channel_masking=use_channel_masking,
+                autocal_col=autocal_col,
+                df_comments=df_comments,
+                df_channel_info=df_channel_info,
+                n_blocks=n_blocks,
+                filter_method_fp=filter_method_fp,
+                fp_savgol_win=fp_savgol_win, fp_savgol_poly=fp_savgol_poly,
+                fp_butter_cutoff=fp_butter_cutoff, fp_butter_order=fp_butter_order,
+                fp_hampel_win=fp_hampel_win, fp_hampel_sig=fp_hampel_sig,
+                filter_method_cbf=filter_method_cbf,
+                cbf_savgol_win=cbf_savgol_win, cbf_savgol_poly=cbf_savgol_poly,
+                cbf_butter_cutoff=cbf_butter_cutoff, cbf_butter_order=cbf_butter_order,
+                cbf_hampel_win=cbf_hampel_win, cbf_hampel_sig=cbf_hampel_sig,
+                beat_mode=beat_mode,
+                beats_k=beats_k if beats_k is not None else 1,
+                bin_sec=bin_sec,
+            )
 
-                    st.session_state.df = df_sorted
-                    st.session_state.all_signals = all_signals
-                    st.session_state.beat_mode = True
-                    st.session_state.agg5_moving_map = agg5_moving_map
-                    st.session_state.peaks_idx = peaks
-                    st.session_state.peaks_idx_cbf = peaks_cbf
+        # Populate session_state from cached results
+        st.session_state.df_raw = df_raw
+        st.session_state.df = df_filtered
+        st.session_state.all_signals = all_signals
+        if beat_mode:
+            st.session_state.beat_mode = True
+            st.session_state.agg5_moving_map = agg5_moving_map
+            st.session_state.peaks_idx = peaks
+            st.session_state.peaks_idx_cbf = peaks_cbf
+        else:
+            st.session_state.beat_mode = False
+            st.session_state.result_df = result_df
 
         # Display Visualization
         st.subheader("Data Visualization")
