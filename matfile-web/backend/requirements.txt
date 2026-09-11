@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+python-multipart
+scipy
+pandas
+numpy
+plotly
+h5py
+xlsxwriter
+pyarrow
+psutil
+pywebview

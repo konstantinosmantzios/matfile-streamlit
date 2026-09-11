@@ -156,7 +156,7 @@ def create_test_plot(t_base_start, t_start, t_stand, t_end_marker, x_fp, y_fp, x
 
 def generate_excel_report(df_filtered, df_resampled, metadata_dict, stats_list, resample_label="Resampled Data", 
                           comment_list=None, baseline_window=None, end_marker_window=None, use_baseline_area=None,
-                          fp_signal=None, cbf_signal=None, raw_df=None, result_df=None, is_beat_mode=False):
+                          fp_signal=None, cbf_signal=None, raw_df=None, agg5_map=None, result_df=None, is_beat_mode=False):
 
     """
     Generates a multi-sheet Excel file containing the analysis data.
@@ -299,7 +299,11 @@ def generate_excel_report(df_filtered, df_resampled, metadata_dict, stats_list, 
         if comment_list and fp_signal and cbf_signal:
             worksheet_plots = writer.book.add_worksheet("Plots")
             
-            if result_df is not None:
+            if is_beat_mode and agg5_map is not None and raw_df is not None:
+                y_fp = agg5_map.get(fp_signal, np.array([]))
+                y_cbf = agg5_map.get(cbf_signal, np.array([]))
+                x_data = raw_df['time_s'].values
+            elif not is_beat_mode and result_df is not None:
                 y_fp = result_df.get(fp_signal, pd.Series()).values
                 y_cbf = result_df.get(cbf_signal, pd.Series()).values
                 x_data = result_df['time_s'].values
