@@ -385,6 +385,8 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                 rec_started_in = ""
                 rec_min_val = np.nan
                 rec_pct_drop = np.nan
+                t_rec_end_ms_interp = None
+                rec_end_val_interp = None
                 
                 if baseline_mean is not None:
                     finite_mask_all = np.isfinite(resampled_y)
@@ -396,8 +398,6 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                         x_post, y_post, t_ms_post = _build_exact_segment(t_start, t_end_data, resampled_x, resampled_y, resampled_t)
                         
                         if len(x_post) > 0:
-                            # Find where y drops below baseline
-                            below_mask = y_post < baseline_mean
                             def _interp_cross(x0, y0, x1, y1, y_target):
                                 if y1 == y0: return x0
                                 return x0 + (y_target - y0) * (x1 - x0) / (y1 - y0)
@@ -408,36 +408,38 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                             
                             while True:
                                 x_post, y_post, _ = _build_exact_segment(t_search_start, t_end_data, resampled_x, resampled_y, resampled_t)
-                                if len(x_post) == 0:
+                                if len(x_post) < 2:
                                     break
-                                    
-                                below_mask = y_post < baseline_mean
-                                if not np.any(below_mask):
+                                
+                                # Find where curve crosses DOWN the baseline value (y_prev >= baseline_mean and y_curr < baseline_mean)
+                                down_cross = np.where((y_post[:-1] >= baseline_mean) & (y_post[1:] < baseline_mean))[0]
+                                if len(down_cross) == 0:
                                     break
-                                    
-                                if below_mask[0]: # already below
-                                    candidate_start = t_search_start
-                                else:
-                                    drop_idx = np.where(below_mask)[0][0]
-                                    candidate_start = _interp_cross(x_post[drop_idx-1], y_post[drop_idx-1], x_post[drop_idx], y_post[drop_idx], baseline_mean)
+                                
+                                drop_idx = down_cross[0]
+                                candidate_start = _interp_cross(x_post[drop_idx], y_post[drop_idx], x_post[drop_idx+1], y_post[drop_idx+1], baseline_mean)
                                     
                                 x_rem, y_rem, _ = _build_exact_segment(candidate_start, t_end_data, resampled_x, resampled_y, resampled_t)
-                                above_mask = y_rem[1:] >= baseline_mean
+                                if len(x_rem) < 2:
+                                    break
+
+                                # Find where curve crosses UP the baseline value (y_prev < baseline_mean and y_curr >= baseline_mean)
+                                up_cross = np.where((y_rem[:-1] < baseline_mean) & (y_rem[1:] >= baseline_mean))[0]
                                 
-                                if np.any(above_mask):
-                                    end_idx = np.where(above_mask)[0][0] + 1
-                                    candidate_end = _interp_cross(x_rem[end_idx-1], y_rem[end_idx-1], x_rem[end_idx], y_rem[end_idx], baseline_mean)
+                                if len(up_cross) > 0:
+                                    end_idx = up_cross[0]
+                                    candidate_end = _interp_cross(x_rem[end_idx], y_rem[end_idx], x_rem[end_idx+1], y_rem[end_idx+1], baseline_mean)
                                     
                                     # Dip must last at least 0.5 seconds
                                     if candidate_end - candidate_start >= 0.5:
                                         if candidate_start <= t_start + 20:
                                             t_rec_start = candidate_start
-                                        if candidate_end <= t_stand + 30:
-                                            t_rec_end = candidate_end
+                                            if candidate_end <= t_stand + 30:
+                                                t_rec_end = candidate_end
                                         break # Stop searching after finding the first valid-length dip
                                     else:
-                                        # Too short, advance search
-                                        t_search_start = candidate_end
+                                        # Too short, advance search past this crossing
+                                        t_search_start = max(candidate_end, candidate_start + 0.5)
                                 else:
                                     # Never recovers above baseline before end of data
                                     if t_end_data - candidate_start >= 0.5:
@@ -458,10 +460,10 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                                 # Usually if there's an end marker, there should be a start marker.
                                 # If it wasn't detected by the 20s rule, we can relax it if an override exists.
                                 if t_rec_start is None:
-                                    # Just use the first point it goes below baseline
-                                    first_cross = np.where((resampled_x > t_start) & (resampled_y < baseline_mean))[0]
-                                    if len(first_cross) > 0:
-                                        t_rec_start = float(np.interp(baseline_mean, [resampled_y[first_cross[0]-1], resampled_y[first_cross[0]]], [resampled_x[first_cross[0]-1], resampled_x[first_cross[0]]]))
+                                    down_cross_all = np.where((resampled_x[:-1] >= t_start) & (resampled_y[:-1] >= baseline_mean) & (resampled_y[1:] < baseline_mean))[0]
+                                    if len(down_cross_all) > 0:
+                                        idx = down_cross_all[0]
+                                        t_rec_start = float(_interp_cross(resampled_x[idx], resampled_y[idx], resampled_x[idx+1], resampled_y[idx+1], baseline_mean))
 
                                     
                             if t_rec_start is not None:

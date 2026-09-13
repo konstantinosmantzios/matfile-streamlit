@@ -44,8 +44,8 @@ Three primary regions are analyzed to evaluate the orthostatic response. The dur
 - **Purpose**: Captures the stabilization response excluding the mechanical transition period.
 
 #### Method 3: Baseline Recovery (Blue Region)
-- **Start**: The exact moment the pressure drops below the Baseline Mean after the Transition. (Extremely brief dips < 0.5s are ignored as noise).
-- **End**: The exact moment the pressure recovers back to the Baseline Mean.
+- **Start**: The exact moment the pressure crosses down the Baseline Mean after the Transition ($y_{prev} \ge \text{Baseline} > y_{curr}$). Points where the curve is already below baseline without crossing down are ignored. Dips lasting < 0.5s are ignored as noise.
+- **End**: The exact moment the pressure crosses up the Baseline Mean ($y_{prev} < \text{Baseline} \le y_{curr}$).
 - **Validity**: If the pressure does not recover within 30 seconds after standing, the recovery is considered incomplete and duration/area stats are omitted.
 
 ### 3.3 Computed Statistics
