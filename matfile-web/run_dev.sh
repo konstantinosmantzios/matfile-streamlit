@@ -8,6 +8,10 @@ echo "========================================="
 # it kills both background processes properly.
 trap 'kill 0' SIGINT SIGTERM EXIT
 
+# Ensure port 8000 is free before starting
+echo "[System] Freeing port 8000..."
+lsof -t -i:8000 | xargs kill -9 2>/dev/null || true
+
 # Start FastAPI backend in the background
 echo "[Backend] Starting FastAPI on http://localhost:8000"
 cd backend

@@ -8,7 +8,7 @@ from processing import (
     estimate_dynamic_hr_array
 )
 
-def process_session_data(df_raw, df_channel_info, df_comments, settings):
+def process_session_data(df_raw, df_channel_info, df_comments, settings, preview_only=False):
     df_sorted = df_raw.sort_values('time_s').copy()
     all_signals = df_sorted.columns[df_sorted.columns.str.contains(':', regex=False)].tolist()
     
@@ -148,6 +148,15 @@ def process_session_data(df_raw, df_channel_info, df_comments, settings):
     for col in all_signals:
         df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce').astype('float32')
 
+    if preview_only:
+        # Skip beat detection and resampling for faster preview
+        return df_sorted, pd.DataFrame(), [], [], {}
+
+    # =========================================================================
+    # STEP 2: Calculate segments and Resample
+    # =========================================================================
+    df_sorted['segment_id'] = (df_sorted['absolute_time'].diff() > pd.Timedelta(seconds=1)).cumsum().astype('float32')
+
     # =========================================================================
     # STEP 2: Resampling (time-based or beat-based with peak detection)
     # =========================================================================
@@ -185,12 +194,37 @@ def process_session_data(df_raw, df_channel_info, df_comments, settings):
         sig0_filtered = pd.to_numeric(df_sorted[main_signal], errors='coerce').astype('float64').values
         
         if "5: HR" in df_sorted.columns and not df_sorted["5: HR"].isna().all():
-            hr = pd.to_numeric(df_sorted["5: HR"], errors='coerce').astype('float64').values
+            hr_raw = pd.to_numeric(df_sorted["5: HR"], errors='coerce').astype('float64').values
             est_hr_arr = estimate_dynamic_hr_array(sig0_filtered, fs0)
-            hr = np.where(np.isnan(hr) | (hr <= 0), est_hr_arr, hr)
+            hr_raw = np.where(np.isnan(hr_raw) | (hr_raw <= 0), est_hr_arr, hr_raw)
         else:
-            hr = estimate_dynamic_hr_array(sig0_filtered, fs0)
+            hr_raw = estimate_dynamic_hr_array(sig0_filtered, fs0)
 
+        # --- Clean HR: Hampel spike removal then rolling-median smoothing ---
+        # Step 1: Hampel filter – replace ±3σ-MAD outliers with local median (window ≈ 1 s at fs0)
+        def _odd(n): return max(5, int(n) if int(n) % 2 == 1 else int(n) + 1)
+        hampel_win = _odd(round(fs0 * 1.0))  # ≈ 1 s, must be odd
+        hr_series = pd.Series(hr_raw)
+        rolling_med = hr_series.rolling(hampel_win, center=True, min_periods=1).median()
+        rolling_mad = hr_series.rolling(hampel_win, center=True, min_periods=1).apply(
+            lambda x: np.median(np.abs(x - np.median(x))), raw=True
+        )
+        threshold = 3.0 * 1.4826 * rolling_mad
+        spike_mask = np.abs(hr_series - rolling_med) > threshold
+        hr_hampel = hr_series.copy()
+        hr_hampel[spike_mask] = rolling_med[spike_mask]
+
+        # Step 2: Rolling-median smooth (≈ 5 s window) to remove remaining jitter
+        smooth_win = _odd(round(fs0 * 5.0))
+        hr_smoothed = hr_hampel.rolling(smooth_win, center=True, min_periods=1).median().to_numpy()
+        # Clip to physiological range
+        hr_smoothed = np.clip(hr_smoothed, 20.0, 250.0)
+
+        # Store smoothed HR back into df_sorted so it can be plotted
+        if "5: HR" in df_sorted.columns:
+            df_sorted["5: HR"] = hr_smoothed.astype('float32')
+
+        hr = hr_smoothed
         hr_for_win = prepare_hr_for_window(hr.copy(), roll_win=1000)
         hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
         win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=2.0, min_samples=3)

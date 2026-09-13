@@ -246,7 +246,12 @@ def comments_df(mat, df_channels):
     com = np.atleast_2d(mat['com'])
     comtext = np.atleast_1d(mat['comtext'])
 
-    block_start_times = [matlab_datenum_to_datetime(bt) for bt in blocktimes]
+    print(f"DEBUG: Raw MATLAB blocktimes: {blocktimes}")
+    block_start_times = []
+    for i, bt in enumerate(blocktimes):
+        dt = matlab_datenum_to_datetime(bt)
+        print(f"DEBUG: Block {i+1} raw datenum={bt} -> parsed python datetime={dt}")
+        block_start_times.append(dt)
     base_samplerate = df_channels["samplerate"].replace(0, np.nan).dropna().iloc[0]
 
     # Calculate block offsets to determine global time_s
@@ -361,8 +366,9 @@ def extract_channel_signals_with_comments(mat, df_comments, start_s=None, end_s=
         if Lb <= 0:
             continue
         base = block_start_times[min(b, len(block_start_times) - 1)]
-        seg_times = [base + timedelta(seconds=k / sr_ref) for k in range(Lb)]
-        abs_time[write_pos:write_pos + Lb] = np.array(seg_times, dtype="datetime64[ns]")
+        base_np = np.datetime64(base)
+        offsets = (np.arange(Lb) * (1e9 / sr_ref)).astype("timedelta64[ns]")
+        abs_time[write_pos:write_pos + Lb] = base_np + offsets
         write_pos += Lb
     df.insert(1, "absolute_time", abs_time[start_idx:end_idx])
     if include_mmss:

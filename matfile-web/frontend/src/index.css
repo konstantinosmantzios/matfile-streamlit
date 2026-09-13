@@ -274,6 +274,34 @@ input[type="range"] {
   justify-content: space-between;
 }
 
+/* Expanding Row */
+.expand-row {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: var(--accent-blue);
+  color: white;
+  border-bottom-left-radius: 18px;
+  border-bottom-right-radius: 18px;
+  overflow: hidden;
+  transition: max-height 0.3s cubic-bezier(0.4, 0, 0.2, 1), padding 0.3s cubic-bezier(0.4, 0, 0.2, 1), opacity 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  font-weight: 600;
+}
+
+.expand-row.expanded {
+  max-height: 100px; /* enough to show the row */
+  padding: 12px 24px;
+  opacity: 1;
+}
+
+.expand-row.collapsed {
+  max-height: 0;
+  padding: 0 24px;
+  opacity: 0;
+  pointer-events: none;
+}
+
 /* Custom Scrollbar */
 ::-webkit-scrollbar {
   width: 8px;

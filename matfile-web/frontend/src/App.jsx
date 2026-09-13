@@ -1,21 +1,39 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
-import { Activity, UploadCloud, Download, Trash2, Settings2 } from 'lucide-react';
+import { Activity, UploadCloud, Download, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Target, X } from 'lucide-react';
 import Plot from 'react-plotly.js';
 import FilterSandbox from './components/FilterSandbox';
 
-const API_BASE_URL = 'http://127.0.0.1:8000/api';
+const API_BASE_URL = 'http://localhost:8000/api';
+
+
 const VIEWPORT_DEBOUNCE_MS = 300;
 const SETTINGS_DEBOUNCE_MS = 600;
 const TARGET_POINTS = 3000;
 
+const getStoredDefaults = () => {
+  try {
+    const stored = localStorage.getItem('matAnalyzerDefaults');
+    if (stored) return JSON.parse(stored);
+  } catch (e) {
+    console.error("Failed to load defaults", e);
+  }
+  return {};
+};
+
 function App() {
+  const storedDefaults = getStoredDefaults();
   const [sessionId, setSessionId] = useState(null);
   const [fileName, setFileName] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [isViewportLoading, setIsViewportLoading] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isConverting, setIsConverting] = useState(false);
   const [error, setError] = useState('');
   const [plotData, setPlotData] = useState([]);
+  const [plotXRange, setPlotXRange] = useState(null);
+  const [plotYRange, setPlotYRange] = useState(null);
+  const [plotRevision, setPlotRevision] = useState(1);
   const [layoutShapes, setLayoutShapes] = useState([]);
   const [layoutAnnotations, setLayoutAnnotations] = useState([]);
   const [availableSignals, setAvailableSignals] = useState([]);
@@ -23,9 +41,33 @@ function App() {
   const [memoryUsage, setMemoryUsage] = useState(null);
   const [memoryInfo, setMemoryInfo] = useState(null);
   const [analysisStats, setAnalysisStats] = useState([]);
-  const [plotXRange, setPlotXRange] = useState({ min: 0, max: 1 });
+  
+  const [analysisView, setAnalysisView] = useState("Filtering Preview");
+  const [compareGaussian, setCompareGaussian] = useState(storedDefaults.compareGaussian ?? false);
+  const [, forceRender] = useState({});
+  
+  // Force Plotly to resize when the layout changes (e.g., right panel appears/disappears)
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      window.dispatchEvent(new Event('resize'));
+    }, 50);
+    return () => clearTimeout(timer);
+  }, [analysisView]);
+
+
+  const [localAnalysisSettings, setLocalAnalysisSettings] = useState({
+    analysisBaselineWindow: storedDefaults.analysisBaselineWindow ?? 30,
+    analysisEndMarkerWindow: storedDefaults.analysisEndMarkerWindow ?? 10,
+    useBaselineArea: storedDefaults.useBaselineArea ?? false,
+    baselineEndComment: storedDefaults.baselineEndComment ?? 'Transition'
+  });
+
+  const [endMarkerOverrides, setEndMarkerOverrides] = useState({});
+  const [editingTestIdx, setEditingTestIdx] = useState(null);
+  const [draftEndMarker, setDraftEndMarker] = useState(null);
 
   // Refs
+  const backendDataRef = useRef(null);
   const initialPlotDataRef = useRef([]);
   const viewportTimeoutRef = useRef(null);
   const currentZoomRef = useRef(null);
@@ -36,6 +78,10 @@ function App() {
   const fileInputRef = useRef(null);
   const analysisStatsRef = useRef([]);
   const initialXRangeRef = useRef({ min: 0, max: 1 });
+  const skipNextSettingsEffectRef = useRef(false);
+  const plotContainerRef = useRef(null);
+  const targetTestIdxRef = useRef(-1); // tracks last explicitly navigated-to test
+  const jumpingToTestRef = useRef(-1); // used to provide instant UI feedback before Plotly blocks the thread
 
   useEffect(() => {
     analysisStatsRef.current = analysisStats;
@@ -43,37 +89,62 @@ function App() {
 
   // Settings
   const [settings, setSettings] = useState({
-    resampleMode: "Beat-based",
-    resampleRateTime: 1,
-    resampleRateBeat: 5,
-    autoCalOption: "Auto-Detect",
-    fpFilter: "Savitzky-Golay",
-    fpSavgolWin: 51,
-    fpSavgolPoly: 5,
-    fpButterCutoff: 5.0,
-    fpButterOrder: 4,
-    fpHampelWin: 5,
-    fpHampelSig: 3.0,
-    cbfFilter: "Butterworth Low-Pass",
-    cbfSavgolWin: 51,
-    cbfSavgolPoly: 5,
-    cbfButterCutoff: 5.0,
-    cbfButterOrder: 4,
-    cbfHampelWin: 5,
-    cbfHampelSig: 3.0,
-    analysisView: "Filtering Preview",
-    baselineWinStart: -60,
-    baselineWinDuration: 30,
-    standingWinStart: 10,
-    standingWinDuration: 30,
-    analysisBaselineWindow: 60,
-    baselineEndComment: "Transition",
-    analysisEndMarkerWindow: 10,
-    devMode: false,
-    compareGaussian: false
+    resampleMode: storedDefaults.resampleMode ?? "Beat-based",
+    resampleRateTime: storedDefaults.resampleRateTime ?? 1,
+    resampleRateBeat: storedDefaults.resampleRateBeat ?? 5,
+    autoCalOption: storedDefaults.autoCalOption ?? "Auto-Detect",
+    fpFilter: storedDefaults.fpFilter ?? "None",
+    fpSavgolWin: storedDefaults.fpSavgolWin ?? 51,
+    fpSavgolPoly: storedDefaults.fpSavgolPoly ?? 5,
+    fpButterCutoff: storedDefaults.fpButterCutoff ?? 5.0,
+    fpButterOrder: storedDefaults.fpButterOrder ?? 4,
+    fpHampelWin: storedDefaults.fpHampelWin ?? 5,
+    fpHampelSig: storedDefaults.fpHampelSig ?? 3.0,
+    cbfFilter: storedDefaults.cbfFilter ?? "None",
+    cbfSavgolWin: storedDefaults.cbfSavgolWin ?? 51,
+    cbfSavgolPoly: storedDefaults.cbfSavgolPoly ?? 5,
+    cbfButterCutoff: storedDefaults.cbfButterCutoff ?? 5.0,
+    cbfButterOrder: storedDefaults.cbfButterOrder ?? 4,
+    cbfHampelWin: storedDefaults.cbfHampelWin ?? 5,
+    cbfHampelSig: storedDefaults.cbfHampelSig ?? 3.0,
+    analysisBaselineWindow: storedDefaults.analysisBaselineWindow ?? 30,
+    baselineEndComment: storedDefaults.baselineEndComment ?? "Transition",
+    analysisEndMarkerWindow: storedDefaults.analysisEndMarkerWindow ?? 10,
+    useMapGaussianForStats: storedDefaults.useMapGaussianForStats ?? false
   });
 
   useEffect(() => { latestSessionIdRef.current = sessionId; }, [sessionId]);
+
+  const handleApplyAnalysisSettings = () => {
+    setSettings(prev => ({
+      ...prev,
+      analysisBaselineWindow: localAnalysisSettings.analysisBaselineWindow,
+      analysisEndMarkerWindow: localAnalysisSettings.analysisEndMarkerWindow,
+      baselineEndComment: localAnalysisSettings.baselineEndComment
+    }));
+  };
+
+  const handleApplyFilteringSettings = () => {
+    setSettings(prev => ({
+      ...prev,
+      ...localFilteringSettings
+    }));
+  };
+
+  const handleSaveDefaults = () => {
+    const defaultsToSave = {
+      ...settings,
+      ...localAnalysisSettings,
+      ...localFilteringSettings,
+      compareGaussian
+    };
+    delete defaultsToSave.selectedSignal;
+    
+    localStorage.setItem('matAnalyzerDefaults', JSON.stringify(defaultsToSave));
+    
+    // Optional: could show a small toast, but a simple alert is fine for now
+    alert('Current settings (filters, baseline, and windows) saved as defaults!');
+  };
 
   // ---- Memory polling ------------------------------------------------
   useEffect(() => {
@@ -85,8 +156,7 @@ function App() {
       } catch (err) { /* ignore */ }
     };
     fetchMemory();
-    const interval = setInterval(fetchMemory, 3000);
-    return () => clearInterval(interval);
+    // Removed setInterval to prevent terminal spam
   }, []);
 
   // ---- Auto-apply settings on change (debounced) ----------------------
@@ -94,6 +164,10 @@ function App() {
     if (isFirstRender.current) { isFirstRender.current = false; return; }
     if (isUploadingRef.current) return;
     if (!latestSessionIdRef.current) return;
+    if (skipNextSettingsEffectRef.current) {
+      skipNextSettingsEffectRef.current = false;
+      return;
+    }
 
     if (settingsDebounceRef.current) clearTimeout(settingsDebounceRef.current);
     settingsDebounceRef.current = setTimeout(() => {
@@ -106,12 +180,51 @@ function App() {
   // ---- Plotly zoom handler --------------------------------------------
   const handleRelayout = useCallback((eventData) => {
     if (!sessionId) return;
-
-    if (eventData['xaxis.autorange']) {
+    
+    const hasYAuto = eventData['yaxis.autorange'] === true;
+    const hasXAuto = eventData['xaxis.autorange'] === true;
+    const hasXRangeArray = Array.isArray(eventData['xaxis.range']);
+    
+    // A double-click on the plot area typically sends yaxis.autorange: true AND xaxis.range: [min, max]
+    // A direct double-click on the X-axis sends xaxis.autorange: true
+    if (hasXAuto || (hasYAuto && hasXRangeArray)) {
       currentZoomRef.current = null;
-      setPlotData([...initialPlotDataRef.current]);
-      setPlotXRange(initialXRangeRef.current);
+      targetTestIdxRef.current = -1;
+      
+      const indicator = document.getElementById('test-indicator');
+      if (indicator && analysisStatsRef.current) {
+        indicator.innerText = `- / ${analysisStatsRef.current.length}`;
+      }
+
+      if (viewportTimeoutRef.current) clearTimeout(viewportTimeoutRef.current);
+      
+      requestAnimationFrame(() => {
+        setTimeout(() => {
+          // Clone the objects so Plotly treats them as new traces and forces a redraw
+          setPlotData(prev => initialPlotDataRef.current ? initialPlotDataRef.current.map(t => ({ ...t })) : prev);
+          setPlotXRange(null);
+          setPlotYRange(null);
+          setPlotRevision(prev => prev + 1); // trigger Plotly update
+        }, 0);
+      });
       return;
+    }
+    
+    // If only Y was autoranged (e.g., double click on Y axis specifically)
+    if (hasYAuto && !hasXRangeArray && !hasXAuto) {
+      setPlotYRange(null);
+      setPlotRevision(prev => prev + 1);
+      return;
+    }
+
+    let yMin = eventData['yaxis.range[0]'];
+    let yMax = eventData['yaxis.range[1]'];
+    if ((yMin === undefined || yMax === undefined) && Array.isArray(eventData['yaxis.range'])) {
+      yMin = eventData['yaxis.range'][0];
+      yMax = eventData['yaxis.range'][1];
+    }
+    if (yMin !== undefined && yMax !== undefined) {
+      setPlotYRange({ min: yMin, max: yMax });
     }
 
     let xMin = eventData['xaxis.range[0]'];
@@ -126,10 +239,17 @@ function App() {
     const xMaxMs = typeof xMax === 'number' ? xMax : new Date(xMax).getTime();
     if (isNaN(xMinMs) || isNaN(xMaxMs)) return;
 
+    if (currentZoomRef.current && 
+        Math.abs(currentZoomRef.current.xMinMs - xMinMs) < 10 && 
+        Math.abs(currentZoomRef.current.xMaxMs - xMaxMs) < 10) {
+        return; // ignore programmatic echo
+    }
+
     currentZoomRef.current = { xMinMs, xMaxMs };
+    targetTestIdxRef.current = -1; // user manually panned, unlock target test
     setPlotXRange({ min: xMinMs, max: xMaxMs });
     
-    if (settings.analysisView === 'Supine to Standing Analysis') {
+    if (analysisView === 'Supine to Standing Analysis') {
       return;
     }
 
@@ -137,7 +257,69 @@ function App() {
     viewportTimeoutRef.current = setTimeout(() => {
       fetchViewport(xMinMs, xMaxMs);
     }, VIEWPORT_DEBOUNCE_MS);
-  }, [sessionId, settings.analysisView]);
+  }, [sessionId, analysisView]);
+
+  const jumpToTest = (targetIdx, buttonName = "Unknown") => {
+    if (!analysisStats || analysisStats.length === 0) return;
+    
+    if (targetIdx < 0) targetIdx = 0;
+    if (targetIdx >= analysisStats.length) targetIdx = analysisStats.length - 1;
+
+    const targetStat = analysisStats[targetIdx];
+    const baseWindowMs = (localAnalysisSettings.analysisBaselineWindow || 30) * 1000;
+    const transMs = targetStat.t_trans_ms || targetStat.t_start_ms || 0;
+    const zoomStart = transMs - baseWindowMs - 5000;
+    const zoomEnd = (targetStat.t_end_ms || (targetStat.t_stand_ms + 30000)) + 10000;
+
+    // Calculate Y auto-range for this specific X window
+    let yMin = Infinity;
+    let yMax = -Infinity;
+    plotData.forEach(trace => {
+      // Only consider visible signal/data traces, not invisible or purely marker traces
+      if (trace.visible === false || trace.visible === 'legendonly') return;
+      if (!trace.x || !trace.y) return;
+      if (trace.name && (trace.name === 'Rec Start' || trace.name === 'Rec End' || trace.name === 'Start' || trace.name === 'End Marker')) return; // ignore visual markers for scaling
+      
+      for (let i = 0; i < trace.x.length; i++) {
+        const xMs = typeof trace.x[i] === 'number' ? trace.x[i] : new Date(trace.x[i]).getTime();
+        if (xMs >= zoomStart && xMs <= zoomEnd) {
+          const y = trace.y[i];
+          if (y !== null && !isNaN(y)) {
+            if (y < yMin) yMin = y;
+            if (y > yMax) yMax = y;
+          }
+        }
+      }
+    });
+    // Update ref immediately so the text component can compute the new state
+    targetTestIdxRef.current = targetIdx;
+    jumpingToTestRef.current = targetIdx;
+    
+    // DIRECT DOM MANIPULATION for instant feedback before thread freezes
+    const indicator = document.getElementById('test-indicator');
+    if (indicator) {
+      indicator.innerText = `${targetIdx + 1} / ${analysisStats.length}`;
+    }
+    
+    // Yield to the browser's layout and paint cycle so the text actually appears on screen 
+    // before Plotly freezes the thread with heavy rendering.
+    requestAnimationFrame(() => {
+      setTimeout(() => {
+        setPlotXRange({ min: zoomStart, max: zoomEnd });
+        currentZoomRef.current = { xMinMs: zoomStart, xMaxMs: zoomEnd };
+        
+        if (yMin !== Infinity && yMax !== -Infinity) {
+          const margin = (yMax - yMin) * 0.1;
+          setPlotYRange({ min: yMin - margin, max: yMax + margin });
+        } else {
+          setPlotYRange(null);
+        }
+        
+        jumpingToTestRef.current = -1; // clear jumping flag
+        setPlotRevision(prev => prev + 1); // trigger Plotly update
+      }, 0);
+    });
+  };
 
   const fetchViewport = async (xMinMs, xMaxMs, sid = sessionId) => {
     if (!sid) return;
@@ -191,34 +373,63 @@ function App() {
       let updatedSettings = { ...settings };
       if (response.data.tests && response.data.tests.length > 0) {
         updatedSettings = { ...updatedSettings, testStartS: response.data.tests[0].start_s, testEndS: response.data.tests[0].end_s };
+        skipNextSettingsEffectRef.current = true;
         setSettings(updatedSettings);
       }
       await processData(response.data.session_id, updatedSettings);
     } catch (err) {
       setError(err.response?.data?.detail || 'Upload failed');
-      setIsLoading(false);
     } finally {
+      setIsLoading(false);
       isUploadingRef.current = false;
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
   // ---- Process data ---------------------------------------------------
-  const processData = async (sid = sessionId, currentSettings = settings) => {
+  const updatePlotFromBackendData = useCallback(() => {
+    if (!backendDataRef.current) return;
+    const data = backendDataRef.current;
+    
+    if (analysisView === 'Filtering Preview') {
+      const traces = (data.filtering_traces || []).filter(t => t.trace_id !== "gauss1000" || compareGaussian);
+      setPlotData(traces);
+      initialPlotDataRef.current = traces;
+      setLayoutShapes(data.filtering_shapes || []);
+      setLayoutAnnotations(data.filtering_annotations || []);
+    } else {
+      const traces = (data.analysis_traces || []).filter(t => t.trace_id !== "gauss1000" || compareGaussian);
+      setPlotData(traces);
+      initialPlotDataRef.current = traces;
+      setLayoutShapes(data.analysis_shapes || []);
+      setLayoutAnnotations(data.analysis_annotations || []);
+    }
+    
+    // Force plot update so layout.xaxis.range is strictly respected
+    setPlotRevision(prev => prev + 1);
+    setAnalysisStats(data.analysis_stats || []);
+  }, [analysisView, compareGaussian]);
+
+  useEffect(() => {
+    updatePlotFromBackendData();
+  }, [updatePlotFromBackendData]);
+
+  const processData = async (sid = sessionId, currentSettings = settings, overrides = endMarkerOverrides) => {
     if (!sid) return;
     setIsLoading(true);
     setError('');
     try {
-      const response = await axios.post(`${API_BASE_URL}/process`, { session_id: sid, settings: currentSettings });
-      const traces = response.data.traces || [];
-      setPlotData(traces);
-      initialPlotDataRef.current = traces;
-      setLayoutShapes(response.data.shapes || []);
-      setLayoutAnnotations(response.data.annotations || []);
-      setAnalysisStats(response.data.analysis_stats || []);
+      const payloadOverrides = Object.keys(overrides).length > 0 ? overrides : undefined;
+      const response = await axios.post(`${API_BASE_URL}/process`, { session_id: sid, settings: currentSettings, end_marker_overrides: payloadOverrides });
+      backendDataRef.current = response.data;
+      
+      const traces = analysisView === 'Filtering Preview' ? (response.data.filtering_traces || []) : (response.data.analysis_traces || []);
+      const filteredTraces = traces.filter(t => t.trace_id !== "gauss1000" || compareGaussian);
+      
+      updatePlotFromBackendData();
       
       let initialMin = null, initialMax = null;
-      traces.forEach(t => {
+      filteredTraces.forEach(t => {
         if (t.x && t.x.length > 0) {
           const min = t.x[0];
           const max = t.x[t.x.length - 1];
@@ -231,6 +442,18 @@ function App() {
         initialXRangeRef.current = rng;
         if (!currentZoomRef.current) {
           setPlotXRange(rng);
+        } else if (targetTestIdxRef.current >= 0 && response.data.analysis_stats) {
+          // If locked on a test, re-calculate the zoom bounds for that test
+          const tStat = response.data.analysis_stats[targetTestIdxRef.current];
+          if (tStat) {
+             const bWin = (currentSettings.analysisBaselineWindow || 30) * 1000;
+             const tMs = tStat.t_trans_ms || tStat.t_start_ms || 0;
+             const zStart = tMs - bWin - 5000;
+             const zEnd = (tStat.t_end_ms || (tStat.t_stand_ms + 30000)) + 10000;
+             currentZoomRef.current = { xMinMs: zStart, xMaxMs: zEnd };
+             setPlotXRange({ min: zStart, max: zEnd });
+          }
+        } else {
         }
       }
       
@@ -238,6 +461,7 @@ function App() {
         setAvailableSignals(response.data.available_signals);
         if (!currentSettings.selectedSignal && response.data.available_signals.length > 0) {
           const defaultSig = response.data.available_signals.find(s => s.includes('Finger Pressure')) || response.data.available_signals[0];
+          skipNextSettingsEffectRef.current = true;
           setSettings(prev => ({ ...prev, selectedSignal: defaultSig }));
         }
       }
@@ -245,7 +469,7 @@ function App() {
       setError(err.response?.data?.detail || 'Processing failed');
     } finally {
       setIsLoading(false);
-      if (currentZoomRef.current && currentSettings.analysisView === 'Filtering Preview') {
+      if (currentZoomRef.current && analysisView === 'Filtering Preview') {
         setTimeout(() => { fetchViewport(currentZoomRef.current.xMinMs, currentZoomRef.current.xMaxMs, sid); }, 50);
       }
     }
@@ -254,20 +478,61 @@ function App() {
   // ---- Export & Clear --------------------------------------------------
   const exportData = async () => {
     if (!sessionId) return;
-    setIsLoading(true);
+    setIsExporting(true);
     try {
-      const response = await axios.post(`${API_BASE_URL}/export`, { session_id: sessionId, settings }, { responseType: 'blob' });
+      const response = await axios.post(`${API_BASE_URL}/export`, { 
+        session_id: sessionId, 
+        settings,
+        end_marker_overrides: endMarkerOverrides
+      }, { responseType: 'blob' });
       const url = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement('a');
       link.href = url;
-      link.setAttribute('download', `matfile_analysis_${fileName.replace('.mat','')}.xlsx`);
+      const dateStr = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const cleanName = fileName.replace(/\.(mat|parquet|csv)$/i, '');
+      link.setAttribute('download', `Analysis_${cleanName}_${dateStr}.xlsx`);
       document.body.appendChild(link);
       link.click();
       link.remove();
     } catch (err) {
       setError('Export failed');
     } finally {
-      setIsLoading(false);
+      setIsExporting(false);
+    }
+  };
+
+
+
+  const handleConvertMat = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    setError('');
+    setIsConverting(true);
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const response = await axios.post(`${API_BASE_URL}/convert`, formData, {
+        responseType: 'blob',
+        headers: { 'Content-Type': 'multipart/form-data' },
+      });
+
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
+      link.href = url;
+      link.setAttribute('download', file.name.replace('.mat', '.parquet'));
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+    } catch (err) {
+      console.error("Convert Error:", err);
+      setError(err.response?.data?.detail || err.message || 'Error converting file');
+    } finally {
+      setIsConverting(false);
+      // clear input
+      event.target.value = '';
     }
   };
 
@@ -288,7 +553,7 @@ function App() {
   };
 
   const updateSetting = (k, v) => setSettings(prev => ({ ...prev, [k]: v }));
-  const isFilteringPreview = settings.analysisView === 'Filtering Preview';
+  const isFilteringPreview = analysisView === 'Filtering Preview';
 
   const getPlottedHz = () => {
     if (!plotData || plotData.length === 0) return null;
@@ -299,50 +564,209 @@ function App() {
     if (durationS <= 0) return null;
     return Math.min(200, pts / durationS).toFixed(1);
   };
+  const isJumping = jumpingToTestRef.current !== -1;
+  let currentTestIdx = targetTestIdxRef.current >= 0 ? targetTestIdxRef.current : -1;
+  
+  if (!isJumping && analysisStats && analysisStats.length > 0 && plotXRange && plotXRange.min && plotXRange.max) {
+    const center = (plotXRange.min + plotXRange.max) / 2;
+    // Validate that the ref index still matches the viewport (it might have been panned away)
+    if (currentTestIdx >= 0 && currentTestIdx < analysisStats.length) {
+      const refStat = analysisStats[currentTestIdx];
+      const refTransMs = refStat.t_trans_ms || refStat.t_start_ms || 0;
+      const refBaseWindowMs = (localAnalysisSettings.analysisBaselineWindow || 30) * 1000;
+      const refZoomStart = refTransMs - refBaseWindowMs - 5000;
+      const refZoomEnd = (refStat.t_end_ms || (refStat.t_stand_ms + 30000)) + 10000;
+      
+      const realStart = Math.min(refZoomStart, refZoomEnd);
+      const realEnd = Math.max(refZoomStart, refZoomEnd);
+      
+      // If viewport center has drifted completely outside this test's viewing window, fall back
+      if (center < realStart || center > realEnd) {
+        currentTestIdx = -1; // will recompute below
+        targetTestIdxRef.current = -1;
+      }
+    } else {
+      currentTestIdx = -1;
+    }
+
+    if (currentTestIdx === -1) {
+      let foundIdx = -1;
+      let minCenterDist = Infinity;
+      
+      // First, try to find a test whose expected viewing window contains the current viewport center
+      for (let idx = 0; idx < analysisStats.length; idx++) {
+        const stat = analysisStats[idx];
+        const transMs = stat.t_trans_ms || stat.t_start_ms || 0;
+        const baseWindowMs = (localAnalysisSettings.analysisBaselineWindow || 30) * 1000;
+        const zoomStart = transMs - baseWindowMs - 5000;
+        const zoomEnd = (stat.t_end_ms || (stat.t_stand_ms + 30000)) + 10000;
+        
+        const realStart = Math.min(zoomStart, zoomEnd);
+        const realEnd = Math.max(zoomStart, zoomEnd);
+        
+        if (center >= realStart && center <= realEnd) {
+           const expectedCenter = (realStart + realEnd) / 2;
+           const dist = Math.abs(expectedCenter - center);
+           if (dist < minCenterDist) {
+             minCenterDist = dist;
+             foundIdx = idx;
+           }
+        }
+      }
+      
+      // If no test contains the center, just find the closest test globally
+      if (foundIdx === -1) {
+        let bestDist = Infinity;
+        analysisStats.forEach((stat, idx) => {
+          const transMs = stat.t_trans_ms || stat.t_start_ms || 0;
+          const baseWindowMs = (localAnalysisSettings.analysisBaselineWindow || 30) * 1000;
+          const zoomStart = transMs - baseWindowMs - 5000;
+          const zoomEnd = (stat.t_end_ms || (stat.t_stand_ms + 30000)) + 10000;
+          const realStart = Math.min(zoomStart, zoomEnd);
+          const realEnd = Math.max(zoomStart, zoomEnd);
+          const expectedCenter = (realStart + realEnd) / 2;
+          const dist = Math.abs(expectedCenter - center);
+          if (dist < bestDist) {
+            bestDist = dist;
+            foundIdx = idx;
+          }
+        });
+      }
+      
+      currentTestIdx = foundIdx;
+      targetTestIdxRef.current = currentTestIdx;
+    }
+  }
+
+  const getVisibleStats = () => {
+    if (analysisView !== 'Supine to Standing Analysis' || currentTestIdx === -1) {
+      return [];
+    }
+    
+    const viewDuration = plotXRange.max - plotXRange.min;
+    const targetStat = analysisStats[currentTestIdx];
+    const tStart = targetStat.t_trans_ms || targetStat.t_start_ms || 0;
+    const tEnd = targetStat.t_end_ms || (targetStat.t_stand_ms + 30000) || 0;
+    
+    const isVisible = (tStart >= plotXRange.min && tStart <= plotXRange.max) || 
+                      (tEnd >= plotXRange.min && tEnd <= plotXRange.max) ||
+                      (tStart <= plotXRange.min && tEnd >= plotXRange.max);
+                      
+    const baseWindowMs = (localAnalysisSettings.analysisBaselineWindow || 30) * 1000;
+    const expectedZoomStart = tStart - baseWindowMs - 5000;
+    const expectedZoomEnd = tEnd + 10000;
+    const realStart = Math.min(expectedZoomStart, expectedZoomEnd);
+    const realEnd = Math.max(expectedZoomStart, expectedZoomEnd);
+    const isExactlyCentered = Math.abs(plotXRange.min - realStart) < 50 && Math.abs(plotXRange.max - realEnd) < 50;
+    if ((viewDuration <= 150000 || isExactlyCentered) && isVisible) {
+      return [targetStat];
+    }
+    
+    return [];
+  };
+  const visibleStats = getVisibleStats();
+  
+  // If we are currently jumping, force the UI to consider the target test focused instantly
+  const noTestFocused = jumpingToTestRef.current !== -1 ? false : visibleStats.length !== 1;
+  const displayedText = noTestFocused ? `- / ${analysisStats ? analysisStats.length : 0}` : `${currentTestIdx + 1} / ${analysisStats ? analysisStats.length : 0}`;
+  
+  if (analysisStats && analysisStats.length > 0) {
+  }
+  
+  let isCentered = false;
+  if (currentTestIdx >= 0 && currentTestIdx < analysisStats.length && plotXRange && plotXRange.min != null) {
+    const targetStat = analysisStats[currentTestIdx];
+    const baseWindowMs = (localAnalysisSettings.analysisBaselineWindow || 30) * 1000;
+    const transMs = targetStat.t_trans_ms || targetStat.t_start_ms || 0;
+    const expectedZoomStart = transMs - baseWindowMs - 5000;
+    const expectedZoomEnd = (targetStat.t_end_ms || (targetStat.t_stand_ms + 30000)) + 10000;
+    
+    // 50ms tolerance for panning floating point changes
+    if (Math.abs(plotXRange.min - expectedZoomStart) < 50 && Math.abs(plotXRange.max - expectedZoomEnd) < 50) {
+      isCentered = true;
+    }
+  }
+
+  const disableRecenter = isCentered || noTestFocused;
 
   return (
     <div className="app-container">
       <main className="main-content">
         
         {/* Top Header */}
-        <div className="glass-panel flex-between top-header" style={{ padding: '16px 24px' }}>
-          <div className="flex-row">
-            <Activity size={24} color="var(--accent-blue)" />
-            <h1 style={{ margin: 0 }}>MAT Analyzer</h1>
+        <div className="glass-panel top-header" style={{ padding: 0, display: 'flex', flexDirection: 'column' }}>
+          <div className="flex-between" style={{ padding: '16px 24px' }}>
+            <div className="flex-row">
+              <Activity size={24} color="var(--accent-blue)" />
+              <h1 style={{ margin: 0 }}>MAT Analyzer</h1>
+              
+              {/* Memory & Resolution Badges */}
+              <div className="flex-row" style={{ marginLeft: 16 }}>
+                {memoryUsage !== null && (
+                  <span className="badge">
+                    Server: {memoryUsage.toFixed(0)} MB
+                  </span>
+                )}
+                {getPlottedHz() !== null && (
+                  <span className="badge badge-active">
+                    Res: ~{getPlottedHz()} Hz
+                  </span>
+                )}
+              </div>
+            </div>
             
-            {/* Memory & Resolution Badges */}
-            <div className="flex-row" style={{ marginLeft: 16 }}>
-              {memoryUsage !== null && (
-                <span className="badge">
-                  Server: {memoryUsage.toFixed(0)} MB
-                </span>
-              )}
-              {getPlottedHz() !== null && (
-                <span className="badge badge-active">
-                  Res: ~{getPlottedHz()} Hz
+            <div className="flex-row">
+              <div className="flex-row" style={{ marginRight: 16, gap: 16 }}>
+                <button
+                  className="btn btn-secondary"
+                  onClick={handleSaveDefaults}
+                  style={{ padding: '4px 10px', fontSize: 12, borderRadius: 6, display: 'flex', alignItems: 'center', border: '1px solid var(--border-color)', background: '#fff', color: 'var(--text-main)', cursor: 'pointer' }}
+                  title="Save current filters, baseline, and end windows as default for future sessions."
+                >
+                  Set Defaults
+                </button>
+              </div>
+              {fileName && (
+                <span className="badge" style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  Active File: {fileName}
+                  <X 
+                    size={14} 
+                    style={{ cursor: isLoading ? 'not-allowed' : 'pointer', opacity: isLoading ? 0.5 : 1, transition: 'opacity 0.2s', marginLeft: 4 }} 
+                    onClick={() => { if (!isLoading) clearSession(); }} 
+                    onMouseEnter={e => { if (!isLoading) e.currentTarget.style.opacity = 0.7; }}
+                    onMouseLeave={e => { if (!isLoading) e.currentTarget.style.opacity = 1; }}
+                  />
                 </span>
               )}
             </div>
           </div>
-          
-          <div className="flex-row">
-            <div className="flex-row" style={{ marginRight: 16 }}>
-              <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', cursor: 'pointer', gap: 6 }}>
-                <input 
-                  type="checkbox" 
-                  checked={settings.devMode} 
-                  onChange={e => updateSetting('devMode', e.target.checked)} 
-                  style={{ cursor: 'pointer' }}
-                />
-                Dev Mode
-              </label>
-            </div>
-            {fileName && <span className="badge">Active File: {fileName}</span>}
-            {sessionId && (
-              <button className="btn btn-danger" onClick={clearSession} disabled={isLoading} style={{ marginLeft: 16, padding: '6px 12px' }}>
-                <Trash2 size={16} /> Close
+          <div className={`expand-row ${editingTestIdx !== null ? 'expanded' : 'collapsed'}`}>
+            <span>Click on the chart to set the new end marker for this test</span>
+            <div style={{ display: 'flex', gap: 8 }}>
+              {draftEndMarker && (
+                <button 
+                  onClick={() => {
+                    const newOverrides = { ...endMarkerOverrides, [editingTestIdx]: draftEndMarker };
+                    setEndMarkerOverrides(newOverrides);
+                    setEditingTestIdx(null);
+                    setDraftEndMarker(null);
+                    processData(sessionId, settings, newOverrides);
+                  }}
+                  style={{ background: '#16a34a', border: 'none', color: 'white', padding: '4px 12px', borderRadius: '16px', cursor: 'pointer', fontWeight: 600 }}
+                >
+                  Apply
+                </button>
+              )}
+              <button 
+                onClick={() => {
+                  setEditingTestIdx(null);
+                  setDraftEndMarker(null);
+                }}
+                style={{ background: 'rgba(255,255,255,0.2)', border: 'none', color: 'white', padding: '4px 12px', borderRadius: '16px', cursor: 'pointer', fontWeight: 600 }}
+              >
+                Cancel
               </button>
-            )}
+            </div>
           </div>
         </div>
 
@@ -353,13 +777,14 @@ function App() {
         )}
 
         {!sessionId && (
-          <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1 }}>
-            <input ref={fileInputRef} type="file" accept=".mat" onChange={handleFileUpload} style={{ display: 'none' }} id="file-upload" />
+          <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, gap: 20 }}>
+            {/* Primary Upload Zone */}
+            <input ref={fileInputRef} type="file" accept=".mat,.parquet" onChange={handleFileUpload} style={{ display: 'none' }} id="file-upload" />
             <label htmlFor="file-upload" className="upload-zone" style={{ width: '100%', maxWidth: 500 }}>
               <UploadCloud className="upload-icon" />
               <div>
-                <h2>Upload LabChart MAT File</h2>
-                <p>Drag and drop or click to browse files</p>
+                <h2>Upload LabChart File</h2>
+                <p>Select a <b>.mat</b> or <b>.parquet</b> file</p>
               </div>
               {isLoading && (
                 <div style={{ marginTop: 16, display: 'flex', alignItems: 'center', gap: 8, color: 'var(--accent-blue)', fontWeight: 600 }}>
@@ -368,6 +793,18 @@ function App() {
                 </div>
               )}
             </label>
+
+            <div style={{ borderTop: '1px solid var(--border-color)', width: '100%', maxWidth: 400, margin: '10px 0' }}></div>
+
+            {/* Conversion Zone */}
+            <input type="file" accept=".mat" onChange={handleConvertMat} style={{ display: 'none' }} id="convert-upload" />
+            <label htmlFor="convert-upload" className="btn btn-primary" style={{ cursor: 'pointer', display: 'flex', gap: 8, padding: '10px 20px', borderRadius: '12px' }}>
+              <Download size={18} />
+              {isConverting ? 'Converting...' : 'Convert .MAT to .Parquet locally'}
+            </label>
+            <p style={{ color: 'var(--text-muted)', fontSize: 13, marginTop: -10 }}>
+              Use this tool first to convert massive .mat files into optimized .parquet files for lightning fast loading.
+            </p>
           </div>
         )}
 
@@ -375,36 +812,26 @@ function App() {
           <>
 
 
-            {/* Test Selector for Analysis Mode */}
-            {!isFilteringPreview && tests && tests.length > 0 && (
-              <div className="glass-panel flex-row" style={{ padding: '16px 24px' }}>
-                <span style={{ fontWeight: 600 }}>Select Test:</span>
-                <select 
-                  style={{ minWidth: 200 }}
-                  value={tests.findIndex(t => t.start_s === settings.testStartS)} 
-                  onChange={e => {
-                    const idx = parseInt(e.target.value);
-                    if(idx >= 0 && tests[idx]) {
-                      setSettings(prev => ({ ...prev, testStartS: tests[idx].start_s, testEndS: tests[idx].end_s }));
-                    }
-                  }}
-                >
-                  {tests.map((test, idx) => (
-                    <option key={idx} value={idx}>Test {idx + 1} ({test.start_time})</option>
-                  ))}
-                </select>
-              </div>
-            )}
+            {/* Test Selector removed: navigation handled entirely by arrow buttons now */}
 
             {/* Plot Container */}
             <div className="glass-panel plot-container" style={{ padding: '24px', minWidth: 0, overflow: 'hidden' }}>
               
               {/* Overlay Loading State */}
-              {(isLoading || isViewportLoading) && (
+              {(isLoading || isViewportLoading || isExporting) && (
                 <div className="loading-overlay">
                   <div className="spinner"></div>
-                  <h3 style={{ margin: 0, color: 'var(--accent-blue)' }}>Processing Data</h3>
-                  <p style={{ marginTop: 4 }}>Applying filters and recalculating...</p>
+                  {isExporting ? (
+                    <>
+                      <h3 style={{ margin: 0, color: 'var(--accent-blue)' }}>Exporting Data</h3>
+                      <p style={{ marginTop: 4 }}>Computing final statistics and generating Excel file...</p>
+                    </>
+                  ) : (
+                    <>
+                      <h3 style={{ margin: 0, color: 'var(--accent-blue)' }}>Processing Data</h3>
+                      <p style={{ marginTop: 4 }}>Applying filters and recalculating...</p>
+                    </>
+                  )}
                 </div>
               )}
 
@@ -414,25 +841,25 @@ function App() {
                 {/* Left: View Toggle */}
                 <div style={{ display: 'flex', background: 'rgba(0,0,0,0.05)', borderRadius: '12px', padding: '4px' }}>
                   <button
-                    onClick={() => updateSetting('analysisView', 'Filtering Preview')}
+                    onClick={() => setAnalysisView('Filtering Preview')}
                     style={{
                       padding: '6px 16px', fontSize: '13px', borderRadius: '8px', border: 'none', cursor: 'pointer',
-                      background: settings.analysisView === 'Filtering Preview' ? '#fff' : 'transparent',
-                      color: settings.analysisView === 'Filtering Preview' ? 'var(--text-main)' : 'var(--text-muted)',
+                      background: analysisView === 'Filtering Preview' ? '#fff' : 'transparent',
+                      color: analysisView === 'Filtering Preview' ? 'var(--text-main)' : 'var(--text-muted)',
                       fontWeight: 600,
-                      boxShadow: settings.analysisView === 'Filtering Preview' ? '0 2px 4px rgba(0,0,0,0.05)' : 'none'
+                      boxShadow: analysisView === 'Filtering Preview' ? '0 2px 4px rgba(0,0,0,0.05)' : 'none'
                     }}
                   >
                     Filtering
                   </button>
                   <button
-                    onClick={() => updateSetting('analysisView', 'Supine to Standing Analysis')}
+                    onClick={() => setAnalysisView('Supine to Standing Analysis')}
                     style={{
                       padding: '6px 16px', fontSize: '13px', borderRadius: '8px', border: 'none', cursor: 'pointer',
-                      background: settings.analysisView === 'Supine to Standing Analysis' ? '#fff' : 'transparent',
-                      color: settings.analysisView === 'Supine to Standing Analysis' ? 'var(--text-main)' : 'var(--text-muted)',
+                      background: analysisView === 'Supine to Standing Analysis' ? '#fff' : 'transparent',
+                      color: analysisView === 'Supine to Standing Analysis' ? 'var(--text-main)' : 'var(--text-muted)',
                       fontWeight: 600,
-                      boxShadow: settings.analysisView === 'Supine to Standing Analysis' ? '0 2px 4px rgba(0,0,0,0.05)' : 'none'
+                      boxShadow: analysisView === 'Supine to Standing Analysis' ? '0 2px 4px rgba(0,0,0,0.05)' : 'none'
                     }}
                   >
                     Analysis
@@ -521,154 +948,344 @@ function App() {
                 </div>
               </div>
               
-              {/* Analysis Settings Row */}
-              {settings.analysisView === 'Supine to Standing Analysis' && (
-                <div className="flex-row" style={{ width: '100%', justifyContent: 'center', marginTop: 12, gap: 24, flexWrap: 'wrap' }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>Baseline Window (s):</span>
+              {/* Filtering Settings Row */}
+              {analysisView === 'Filtering & Preprocessing' && settings.selectedSignal && settings.selectedSignal.includes('Finger Pressure') && (
+                <div className="glass-panel flex-row" style={{ width: '100%', justifyContent: 'flex-end', padding: '12px 20px', marginTop: 16 }}>
+                  <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-main)', display: 'flex', alignItems: 'center', cursor: 'pointer', gap: 8, background: compareGaussian ? 'rgba(59, 130, 246, 0.05)' : 'transparent', padding: '6px 12px', borderRadius: 8, transition: 'all 0.2s', border: compareGaussian ? '1px solid rgba(59, 130, 246, 0.2)' : '1px solid transparent' }}>
                     <input 
-                      type="number"
-                      value={settings.analysisBaselineWindow}
-                      onChange={e => updateSetting('analysisBaselineWindow', parseInt(e.target.value) || 0)}
-                      style={{ width: 60, padding: '2px 6px', borderRadius: 4, border: '1px solid var(--border-color)', background: 'var(--bg-main)', color: 'var(--text-main)', fontSize: 13 }}
+                      type="checkbox" 
+                      style={{ accentColor: 'var(--accent-blue)', width: '16px', height: '16px', cursor: 'pointer' }}
+                      checked={compareGaussian} 
+                      onChange={e => setCompareGaussian(e.target.checked)} 
                     />
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>Baseline Ends At:</span>
-                    <select 
-                      value={settings.baselineEndComment}
-                      onChange={e => updateSetting('baselineEndComment', e.target.value)}
-                      style={{ padding: '2px 6px', borderRadius: 4, border: '1px solid var(--border-color)', background: 'var(--bg-main)', color: 'var(--text-main)', fontSize: 13 }}
-                    >
-                      <option value="Transition">Transition Comment</option>
-                      <option value="Standing">Standing Comment</option>
-                    </select>
-                  </div>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                    <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>End Marker Window (s):</span>
-                    <input 
-                      type="number"
-                      value={settings.analysisEndMarkerWindow}
-                      onChange={e => updateSetting('analysisEndMarkerWindow', parseInt(e.target.value) || 0)}
-                      style={{ width: 60, padding: '2px 6px', borderRadius: 4, border: '1px solid var(--border-color)', background: 'var(--bg-main)', color: 'var(--text-main)', fontSize: 13 }}
-                    />
-                  </div>
-
-                  {settings.selectedSignal && settings.selectedSignal.includes('Finger Pressure') && (
-                    <div style={{ width: '1px', height: '16px', background: 'var(--border-color)' }}></div>
-                  )}
-
-                  {settings.selectedSignal && settings.selectedSignal.includes('Finger Pressure') && (
-                    <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', cursor: 'pointer', gap: 6 }}>
-                      <input 
-                        type="checkbox" 
-                        checked={settings.compareGaussian} 
-                        onChange={e => updateSetting('compareGaussian', e.target.checked)} 
-                        style={{ cursor: 'pointer' }}
-                      />
-                      Compare Gaussian (1000) vs Resampled
-                    </label>
-                  )}
+                    MAP - Gaussian (5sec)
+                  </label>
                 </div>
               )}
 
-              {plotData.length > 0 ? (
-                <div style={{ width: '100%', display: 'flex', flexDirection: 'column' }}>
-                  {settings.analysisView === 'Supine to Standing Analysis' && analysisStats && analysisStats.length > 0 && (
-                    <div style={{ position: 'relative', height: '130px', marginLeft: '45px', marginRight: '25px', overflow: 'hidden', marginTop: '10px' }}>
-                      {analysisStats.map((stat, i) => {
-                        if (!stat.t_start_ms) return null;
-                        const leftPct = ((stat.t_start_ms - plotXRange.min) / (plotXRange.max - plotXRange.min)) * 100;
-                        if (leftPct < -100 || leftPct > 200) return null; // out of view buffer
-                        
-                        const _fmt = (v) => v !== null && v !== undefined ? v.toFixed(2) : "—";
-                        return (
-                          <div id={`stat-card-${stat.id || i}`} key={stat.id || i} style={{
-                            position: 'absolute',
-                            left: `${leftPct}%`,
-                            top: 0,
-                            transform: 'translateX(-50%)',
-                            pointerEvents: 'auto',
-                            width: '490px',
-                            background: 'rgba(15, 15, 20, 0.92)',
-                            color: 'white',
-                            padding: '10px',
-                            borderRadius: '8px',
-                            border: '1px solid rgba(255,255,255,0.15)',
-                            fontSize: '11px',
-                            fontFamily: 'var(--font-sans)',
-                            lineHeight: '1.4',
-                            boxShadow: '0 4px 12px rgba(0,0,0,0.15)',
-                            display: 'flex',
-                            flexDirection: 'column',
-                            gap: '6px'
-                          }}>
-                            {/* Header Row */}
-                            <div style={{ display: 'flex', justifyContent: 'space-between', fontWeight: 600, borderBottom: '1px solid rgba(255,255,255,0.15)', paddingBottom: '4px' }}>
-                              <span>Base: <span style={{ color: '#60a5fa' }}>{_fmt(stat.baseline)}</span></span>
-                              <span>Time: <span style={{ color: '#facc15' }}>{stat.transition_time !== null ? `${stat.transition_time.toFixed(1)}s` : "—"}</span></span>
-                              <span>End: <span style={{ color: '#ef4444' }}>{_fmt(stat.end_val)}</span></span>
-                            </div>
-                            
-                            {/* Columns */}
-                            <div style={{ display: 'flex', gap: '12px' }}>
-                              {/* Orange Column */}
-                              <div style={{ flex: 1 }}>
-                                <div style={{ color: '#f97316', fontWeight: 600, marginBottom: '2px' }}>🟠 Trans to End</div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Duration:</span> <span>{stat.or_duration !== null ? `${stat.or_duration.toFixed(1)}s` : "—"}</span></div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Drop:</span> <span>{_fmt(stat.or_pct_drop)}%</span></div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Min:</span> <span>{_fmt(stat.or_min_val)}</span></div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Area:</span> <span>{_fmt(stat.or_area_above)}/{_fmt(stat.or_area_below)}</span></div>
-                              </div>
-                              {/* Divider */}
-                              <div style={{ width: '1px', background: 'rgba(255,255,255,0.1)' }}></div>
-                              {/* Green Column */}
-                              <div style={{ flex: 1 }}>
-                                <div style={{ color: '#22c55e', fontWeight: 600, marginBottom: '2px' }}>🟢 Stand to End</div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Duration:</span> <span>{stat.gr_duration !== null ? `${stat.gr_duration.toFixed(1)}s` : "—"}</span></div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Drop:</span> <span>{_fmt(stat.gr_pct_drop)}%</span></div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Min:</span> <span>{_fmt(stat.gr_min_val)}</span></div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Area:</span> <span>{_fmt(stat.gr_area_above)}/{_fmt(stat.gr_area_below)}</span></div>
-                              </div>
-                              {/* Divider */}
-                              <div style={{ width: '1px', background: 'rgba(255,255,255,0.1)' }}></div>
-                              {/* Blue Column */}
-                              <div style={{ flex: 1 }}>
-                                <div style={{ color: '#3b82f6', fontWeight: 600, marginBottom: '2px' }}>🔵 Baseline Recovery</div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Drop:</span> <span>{stat.rec_pct_drop !== null ? `${stat.rec_pct_drop.toFixed(2)}%` : "—"}</span></div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Min:</span> <span>{_fmt(stat.rec_min_val)}</span></div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Duration:</span> <span>{stat.rec_duration !== null ? `${stat.rec_duration.toFixed(1)}s` : "—"}</span></div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Started In:</span> <span>{stat.rec_started_in || "—"}</span></div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: '#9ca3af' }}>Area:</span> <span>{_fmt(stat.rec_area)}</span></div>
-                              </div>
-                            </div>
-                          </div>
-                        );
-                      })}
+              {/* Analysis Settings Row */}
+              {analysisView === 'Supine to Standing Analysis' && (
+                <div className="glass-panel flex-row" style={{ width: '100%', justifyContent: 'space-between', padding: '12px 20px', marginTop: 16, gap: 16, flexWrap: 'wrap' }}>
+                  <div className="flex-row" style={{ gap: 24 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>Baseline Window:</span>
+                      <div style={{ display: 'flex', alignItems: 'center', background: 'var(--bg-main)', border: '1px solid var(--border-color)', borderRadius: 6, padding: '2px 8px' }}>
+                        <input 
+                          type="number"
+                          value={localAnalysisSettings.analysisBaselineWindow}
+                          onChange={e => setLocalAnalysisSettings(prev => ({ ...prev, analysisBaselineWindow: parseInt(e.target.value) || 0 }))}
+                          style={{ width: 40, border: 'none', background: 'transparent', color: 'var(--text-main)', fontSize: 13, outline: 'none', textAlign: 'center' }}
+                        />
+                        <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 4 }}>sec</span>
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>Ends At:</span>
+                      <select 
+                        value={localAnalysisSettings.baselineEndComment}
+                        onChange={e => setLocalAnalysisSettings(prev => ({ ...prev, baselineEndComment: e.target.value }))}
+                        style={{ padding: '4px 8px', borderRadius: 6, border: '1px solid var(--border-color)', background: 'var(--bg-main)', color: 'var(--text-main)', fontSize: 13, outline: 'none', cursor: 'pointer' }}
+                      >
+                        <option value="Transition">Transition</option>
+                        <option value="Standing">Standing</option>
+                      </select>
+                    </div>
+
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>End Window:</span>
+                      <div style={{ display: 'flex', alignItems: 'center', background: 'var(--bg-main)', border: '1px solid var(--border-color)', borderRadius: 6, padding: '2px 8px' }}>
+                        <input 
+                          type="number"
+                          value={localAnalysisSettings.analysisEndMarkerWindow}
+                          onChange={e => setLocalAnalysisSettings(prev => ({ ...prev, analysisEndMarkerWindow: parseInt(e.target.value) || 0 }))}
+                          style={{ width: 40, border: 'none', background: 'transparent', color: 'var(--text-main)', fontSize: 13, outline: 'none', textAlign: 'center' }}
+                        />
+                        <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 4 }}>sec</span>
+                      </div>
+                    </div>
+                    
+                    <button 
+                      className="btn btn-primary" 
+                      onClick={handleApplyAnalysisSettings}
+                      style={{ padding: '6px 12px', fontSize: 13, borderRadius: 6 }}
+                    >
+                      Apply Settings
+                    </button>
+                  </div>
+
+                  {settings.selectedSignal && settings.selectedSignal.includes('Finger Pressure') && (
+                    <div className="flex-row" style={{ gap: 16 }}>
+                      <div style={{ width: '1px', height: '20px', background: 'var(--border-color)' }}></div>
+                      <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-main)', display: 'flex', alignItems: 'center', cursor: 'pointer', gap: 8, background: settings.useMapGaussianForStats ? 'rgba(234, 88, 12, 0.05)' : 'transparent', padding: '6px 12px', borderRadius: 8, transition: 'all 0.2s', border: settings.useMapGaussianForStats ? '1px solid rgba(234, 88, 12, 0.2)' : '1px solid transparent' }}>
+                        <input 
+                          type="checkbox" 
+                          style={{ accentColor: '#ea580c', width: '16px', height: '16px', cursor: 'pointer' }}
+                          checked={settings.useMapGaussianForStats} 
+                          onChange={e => setSettings(prev => ({ ...prev, useMapGaussianForStats: e.target.checked }))} 
+                        />
+                        Use MAP - Gaussian (5sec)
+                      </label>
+                      <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-main)', display: 'flex', alignItems: 'center', cursor: 'pointer', gap: 8, background: compareGaussian ? 'rgba(59, 130, 246, 0.05)' : 'transparent', padding: '6px 12px', borderRadius: 8, transition: 'all 0.2s', border: compareGaussian ? '1px solid rgba(59, 130, 246, 0.2)' : '1px solid transparent' }}>
+                        <input 
+                          type="checkbox" 
+                          style={{ accentColor: 'var(--accent-blue)', width: '16px', height: '16px', cursor: 'pointer' }}
+                          checked={compareGaussian} 
+                          onChange={e => setCompareGaussian(e.target.checked)} 
+                        />
+                        Show MAP - Gaussian (5sec)
+                      </label>
                     </div>
                   )}
-                  <Plot
+                </div>
+              )}
+              {plotData.length > 0 ? (
+                <div style={{ width: '100%', display: 'flex', flexDirection: 'row', gap: 24 }}>
+                  <div ref={plotContainerRef} style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
+                    <Plot
                     data={plotData}
                     layout={{
+                      autosize: true,
                       plot_bgcolor: 'transparent',
                       paper_bgcolor: 'transparent',
                       font: { color: 'var(--text-main)', family: 'var(--font-sans)' },
                       margin: { l: 45, r: 25, t: 30, b: 40 },
-                      shapes: layoutShapes,
+                      shapes: draftEndMarker ? [...layoutShapes, {
+                        type: 'line',
+                        x0: draftEndMarker, x1: draftEndMarker,
+                        y0: 0, y1: 1,
+                        xref: 'x', yref: 'paper',
+                        line: { color: '#ea580c', width: 2, dash: 'dot' }
+                      }] : layoutShapes,
                       annotations: layoutAnnotations,
-                      xaxis: { title: 'Time', gridcolor: 'rgba(0,0,0,0.05)', type: 'date' },
-                      yaxis: { title: 'Amplitude', gridcolor: 'rgba(0,0,0,0.05)' },
+                      xaxis: { 
+                        title: 'Time', 
+                        gridcolor: 'rgba(0,0,0,0.05)', 
+                        type: 'date',
+                        ...(plotXRange && plotXRange.min && plotXRange.max ? { range: [plotXRange.min, plotXRange.max] } : { autorange: true })
+                      },
+                      yaxis: { 
+                        title: 'Amplitude', 
+                        gridcolor: 'rgba(0,0,0,0.05)',
+                        ...(plotYRange ? { range: [plotYRange.min, plotYRange.max] } : { autorange: true })
+                      },
                       showlegend: true,
                       legend: { orientation: 'h', y: 1.15, x: 0.5, xanchor: 'center' },
-                      uirevision: 'true',
+                      uirevision: plotRevision,
                     }}
                     config={{ responsive: true, scrollZoom: false, displayModeBar: true }}
                     onRelayout={handleRelayout}
+                    onClick={(e) => {
+                      if (editingTestIdx !== null && e.points && e.points.length > 0) {
+                        const x = e.points[0].x;
+                        const xMs = typeof x === 'number' ? x : new Date(x).getTime();
+                        setDraftEndMarker(xMs);
+                      }
+                    }}
                     useResizeHandler={true}
-                    style={{ width: '100%', height: '620px' }}
+                    style={{ width: '100%', height: '620px', cursor: editingTestIdx !== null ? 'crosshair' : 'default' }}
                   />
+                  </div>
+                  {/* Right: Stats Table or Placeholder */}
+                  {analysisView === 'Supine to Standing Analysis' && (
+                    <div style={{ width: '280px', flexShrink: 0, display: 'flex', flexDirection: 'column', gap: 16, marginTop: 30 }}>
+                      {visibleStats.length === 1 ? (() => {
+                        const stat = visibleStats[0];
+                        const _fmt = (v, digits=2) => (v !== null && v !== undefined && typeof v === 'number') ? v.toFixed(digits) : "—";
+                        return (
+                          <div style={{
+                            background: 'rgba(255, 255, 255, 0.85)',
+                            backdropFilter: 'blur(16px)',
+                            WebkitBackdropFilter: 'blur(16px)',
+                            color: 'var(--text-main)',
+                            padding: '16px',
+                            borderRadius: '16px',
+                            border: '1px solid rgba(0,0,0,0.08)',
+                            fontSize: '12px',
+                            fontFamily: 'var(--font-sans)',
+                            boxShadow: '0 8px 32px rgba(0,0,0,0.08)',
+                            display: 'flex',
+                            flexDirection: 'column',
+                            gap: '16px',
+                          }}>
+                            {/* Header Row */}
+                            <div style={{ display: 'flex', justifyContent: 'center', alignItems: 'center', fontWeight: 600, borderBottom: '1px solid rgba(0,0,0,0.08)', paddingBottom: '12px', fontSize: '13px' }}>
+                              <span>Transition Duration: <span style={{ color: 'var(--text-main)', fontWeight: 700 }}>{stat.transition_time != null ? `${_fmt(stat.transition_time, 1)}s` : "—"}</span></span>
+                            </div>
+                            
+                            {/* Stacked Sections */}
+                            
+                            {/* Orange Section */}
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                              <div style={{ color: '#ea580c', fontWeight: 700, marginBottom: '4px', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{width: 8, height: 8, borderRadius: '50%', background: '#ea580c'}}></div>
+                                Transition to End
+                              </div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Duration:</span> <span style={{fontWeight: 600}}>{stat.or_duration != null ? `${_fmt(stat.or_duration, 1)}s` : "—"}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Drop:</span> <span style={{fontWeight: 600}}>{stat.or_pct_drop != null ? `${_fmt(stat.or_pct_drop, 2)}%` : "—"}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Min:</span> <span style={{fontWeight: 600}}>{_fmt(stat.or_min_val)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>AUC:</span> <span style={{fontWeight: 600}}>{_fmt(stat.or_area_below)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Start Value:</span> <span style={{fontWeight: 600}}>{_fmt(stat.or_trans_val)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>End Value:</span> <span style={{fontWeight: 600}}>{_fmt(stat.end_val)}</span></div>
+                            </div>
+                            
+                            <div style={{ height: '1px', background: 'rgba(0,0,0,0.08)' }}></div>
+                            
+                            {/* Green Section */}
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                              <div style={{ color: '#16a34a', fontWeight: 700, marginBottom: '4px', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{width: 8, height: 8, borderRadius: '50%', background: '#16a34a'}}></div>
+                                Stand to End
+                              </div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Duration:</span> <span style={{fontWeight: 600}}>{stat.gr_duration != null ? `${_fmt(stat.gr_duration, 1)}s` : "—"}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Drop:</span> <span style={{fontWeight: 600}}>{stat.gr_pct_drop != null ? `${_fmt(stat.gr_pct_drop, 2)}%` : "—"}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Min:</span> <span style={{fontWeight: 600}}>{_fmt(stat.gr_min_val)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>AUC:</span> <span style={{fontWeight: 600}}>{_fmt(stat.gr_area_below)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Start Value:</span> <span style={{fontWeight: 600}}>{_fmt(stat.gr_stand_val)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>End Value:</span> <span style={{fontWeight: 600}}>{_fmt(stat.end_val)}</span></div>
+                            </div>
+                            
+                            <div style={{ height: '1px', background: 'rgba(0,0,0,0.08)' }}></div>
+                            
+                            {/* Blue Section */}
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
+                              <div style={{ color: '#2563eb', fontWeight: 700, marginBottom: '4px', fontSize: '13px', display: 'flex', alignItems: 'center', gap: '6px' }}>
+                                <div style={{width: 8, height: 8, borderRadius: '50%', background: '#2563eb'}}></div>
+                                Baseline-Based
+                              </div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Duration:</span> <span style={{fontWeight: 600}}>{stat.rec_duration != null ? `${_fmt(stat.rec_duration, 1)}s` : "—"}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Drop:</span> <span style={{fontWeight: 600}}>{stat.rec_pct_drop != null ? `${_fmt(stat.rec_pct_drop, 2)}%` : "—"}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Min:</span> <span style={{fontWeight: 600}}>{_fmt(stat.rec_min_val)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>AUC:</span> <span style={{fontWeight: 600}}>{_fmt(stat.rec_area)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Baseline Value:</span> <span style={{fontWeight: 600}}>{_fmt(stat.baseline)}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between' }}><span style={{ color: 'var(--text-muted)' }}>Started In:</span> <span style={{fontWeight: 600}}>{stat.rec_started_in || "—"}</span></div>
+                              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginTop: 4 }}>
+                                <span style={{ color: 'var(--text-muted)' }}>End Marker {endMarkerOverrides[stat.id] ? <span style={{color: '#ea580c'}}>(Edited)</span> : ''}:</span>
+                                <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                  <span style={{fontWeight: 600}}>{stat.rec_end_ms ? new Date(stat.rec_end_ms).toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' }) : "Not found"}</span>
+                                  {endMarkerOverrides[stat.id] && (
+                                    <button
+                                      onClick={() => {
+                                        const newOverrides = { ...endMarkerOverrides };
+                                        delete newOverrides[stat.id];
+                                        setEndMarkerOverrides(newOverrides);
+                                        processData(sessionId, settings, newOverrides);
+                                      }}
+                                      style={{
+                                        background: 'rgba(239, 68, 68, 0.1)', color: '#ef4444', border: '1px solid rgba(239, 68, 68, 0.2)', borderRadius: '4px', padding: '2px 8px', fontSize: '11px', cursor: 'pointer', fontWeight: 600
+                                      }}
+                                    >
+                                      Reset
+                                    </button>
+                                  )}
+                                  <button
+                                    onClick={() => {
+                                      setEditingTestIdx(stat.id);
+                                      if (plotContainerRef.current) {
+                                        plotContainerRef.current.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                                      }
+                                    }}
+                                    style={{
+                                      background: 'var(--accent-blue)', color: 'white', border: 'none', borderRadius: '4px', padding: '2px 8px', fontSize: '11px', cursor: 'pointer', fontWeight: 600
+                                    }}
+                                  >
+                                    {stat.rec_end_ms ? "Edit" : "Add"}
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                            
+                          </div>
+                        );
+                      })() : (
+                        <div style={{
+                          background: 'rgba(255, 255, 255, 0.4)',
+                          backdropFilter: 'blur(16px)',
+                          WebkitBackdropFilter: 'blur(16px)',
+                          color: 'var(--text-muted)',
+                          padding: '32px 16px',
+                          borderRadius: '16px',
+                          border: '1px dashed rgba(0,0,0,0.15)',
+                          fontSize: '13px',
+                          fontFamily: 'var(--font-sans)',
+                          textAlign: 'center',
+                          display: 'flex',
+                          flexDirection: 'column',
+                          alignItems: 'center',
+                          gap: '12px'
+                        }}>
+                          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                            <circle cx="11" cy="11" r="8"></circle>
+                            <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
+                            <line x1="11" y1="8" x2="11" y2="14"></line>
+                            <line x1="8" y1="11" x2="14" y2="11"></line>
+                          </svg>
+                          {visibleStats.length === 0 ? "Pan the plot to view a test's statistics." : "Zoom in to a single test to view its statistics."}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
               ) : null}
+
+              {/* Navigation Buttons Centered Below Plot */}
+              {analysisView === 'Supine to Standing Analysis' && analysisStats && analysisStats.length > 0 && (
+                <div style={{ display: 'flex', justifyContent: 'center', marginTop: 16 }}>
+                  <div className="flex-row" style={{ gap: 4, padding: '8px 16px', background: 'rgba(255,255,255,0.5)', backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)', borderRadius: 12, border: '1px solid var(--border-color)', boxShadow: '0 4px 12px rgba(0,0,0,0.03)' }}>
+                    <button 
+                      className="btn btn-secondary" 
+                      onClick={() => jumpToTest(0)}
+                      disabled={currentTestIdx <= 0 && !noTestFocused}
+                      style={{ padding: '6px 8px', fontSize: 13, borderRadius: 6, display: 'flex', alignItems: 'center', border: '1px solid var(--border-color)', background: (currentTestIdx <= 0 && !noTestFocused) ? 'rgba(0,0,0,0.02)' : '#fff', color: (currentTestIdx <= 0 && !noTestFocused) ? 'var(--text-muted)' : 'var(--text-main)', cursor: (currentTestIdx <= 0 && !noTestFocused) ? 'not-allowed' : 'pointer', opacity: (currentTestIdx <= 0 && !noTestFocused) ? 0.5 : 1 }}
+                      title="Go to First Test"
+                    >
+                      <ChevronsLeft size={16} />
+                    </button>
+                    <button 
+                      className="btn btn-secondary" 
+                      onClick={() => jumpToTest(currentTestIdx - 1)}
+                      disabled={currentTestIdx <= 0 || noTestFocused}
+                      style={{ padding: '6px 12px', fontSize: 13, borderRadius: 6, display: 'flex', alignItems: 'center', gap: 4, border: '1px solid var(--border-color)', background: (currentTestIdx <= 0 || noTestFocused) ? 'rgba(0,0,0,0.02)' : '#fff', color: (currentTestIdx <= 0 || noTestFocused) ? 'var(--text-muted)' : 'var(--text-main)', cursor: (currentTestIdx <= 0 || noTestFocused) ? 'not-allowed' : 'pointer', opacity: (currentTestIdx <= 0 || noTestFocused) ? 0.5 : 1 }}
+                    >
+                      <ChevronLeft size={16} /> Prev
+                    </button>
+                    
+                    <div id="test-indicator" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', minWidth: 60, padding: '0 4px', fontSize: 13, fontWeight: 600, color: 'var(--text-main)', margin: '0 4px' }}>
+                      {noTestFocused ? `- / ${analysisStats.length}` : `${currentTestIdx + 1} / ${analysisStats.length}`}
+                    </div>
+
+                    <button 
+                      className="btn btn-secondary" 
+                      onClick={() => jumpToTest(currentTestIdx + 1)}
+                      disabled={currentTestIdx >= analysisStats.length - 1 || noTestFocused}
+                      style={{ padding: '6px 12px', fontSize: 13, borderRadius: 6, display: 'flex', alignItems: 'center', gap: 4, border: '1px solid var(--border-color)', background: (currentTestIdx >= analysisStats.length - 1 || noTestFocused) ? 'rgba(0,0,0,0.02)' : '#fff', color: (currentTestIdx >= analysisStats.length - 1 || noTestFocused) ? 'var(--text-muted)' : 'var(--text-main)', cursor: (currentTestIdx >= analysisStats.length - 1 || noTestFocused) ? 'not-allowed' : 'pointer', opacity: (currentTestIdx >= analysisStats.length - 1 || noTestFocused) ? 0.5 : 1 }}
+                    >
+                      Next <ChevronRight size={16} />
+                    </button>
+                    <button 
+                      className="btn btn-secondary" 
+                      onClick={() => jumpToTest(analysisStats.length - 1)}
+                      disabled={currentTestIdx >= analysisStats.length - 1 && !noTestFocused}
+                      style={{ padding: '6px 8px', fontSize: 13, borderRadius: 6, display: 'flex', alignItems: 'center', border: '1px solid var(--border-color)', background: (currentTestIdx >= analysisStats.length - 1 && !noTestFocused) ? 'rgba(0,0,0,0.02)' : '#fff', color: (currentTestIdx >= analysisStats.length - 1 && !noTestFocused) ? 'var(--text-muted)' : 'var(--text-main)', cursor: (currentTestIdx >= analysisStats.length - 1 && !noTestFocused) ? 'not-allowed' : 'pointer', opacity: (currentTestIdx >= analysisStats.length - 1 && !noTestFocused) ? 0.5 : 1 }}
+                      title="Go to Last Test"
+                    >
+                      <ChevronsRight size={16} />
+                    </button>
+
+                    <div style={{ width: 1, height: 24, background: 'var(--border-color)', margin: '0 8px' }}></div>
+
+                    <button 
+                      className="btn btn-secondary" 
+                      onClick={() => jumpToTest(currentTestIdx)}
+                      disabled={disableRecenter}
+                      style={{ padding: '6px 12px', fontSize: 13, borderRadius: 6, display: 'flex', alignItems: 'center', gap: 6, border: '1px solid var(--border-color)', background: disableRecenter ? 'rgba(0,0,0,0.02)' : '#fff', color: disableRecenter ? 'var(--text-muted)' : 'var(--text-main)', cursor: disableRecenter ? 'not-allowed' : 'pointer', opacity: disableRecenter ? 0.5 : 1 }}
+                      title="Recenter Current Test"
+                    >
+                      <Target size={16} /> Recenter
+                    </button>
+                  </div>
+                </div>
+              )}
             </div>
 
             {/* Filter Sandboxes */}
