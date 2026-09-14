@@ -28,3 +28,6 @@ temp/
 **/temp/
 *.parquet
 *.mat
+
+# Compiled Desktop Application (build outputs)
+dist_desktop/
