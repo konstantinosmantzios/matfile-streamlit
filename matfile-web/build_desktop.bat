@@ -14,6 +14,15 @@ set OUTPUT_DIR=%SCRIPT_DIR%dist_desktop
 echo.
 echo [Step 1/3] Building frontend static bundle (Vite)...
 cd /d "%FRONTEND_DIR%"
+
+echo Installing frontend dependencies...
+call npm install
+if errorlevel 1 (
+    echo [Error] npm install failed. Make sure Node.js is installed!
+    exit /b 1
+)
+
+echo Building frontend...
 call npm run build
 if errorlevel 1 (
     echo [Error] Frontend build failed.
@@ -41,6 +50,13 @@ echo [Step 2/3] Nuitka is ready.
 echo.
 echo [Step 3/3] Compiling standalone desktop application with Nuitka...
 cd /d "%BACKEND_DIR%"
+
+echo Installing backend dependencies...
+python -m pip install -r requirements.txt
+if errorlevel 1 (
+    echo [Error] pip install failed.
+    exit /b 1
+)
 
 if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 
