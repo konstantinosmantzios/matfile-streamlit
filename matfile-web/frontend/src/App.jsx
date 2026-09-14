@@ -991,8 +991,8 @@ function App() {
                 <div className="glass-panel" style={{ width: '100%', padding: '12px 20px', marginTop: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
                   {/* Row 1: Baseline settings and Apply */}
                   <div className="flex-row" style={{ gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} title="Duration of the baseline value (blue line) before the comment selected in 'Baseline Ends At'. Used for the Baseline-based method.">
-                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }} title="Duration of the baseline value (blue line) before the comment selected in 'Baseline Ends At'. Used for the Baseline-based method.">
                         Baseline Window
                         <Info size={14} style={{ opacity: 0.7 }} />
                       </span>
@@ -1007,8 +1007,8 @@ function App() {
                       </div>
                     </div>
 
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} title="The reference comment point to calculate the baseline value before it. Used for the Baseline-based method.">
-                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }} title="The reference comment point to calculate the baseline value before it. Used for the Baseline-based method.">
                         Baseline Ends At
                         <Info size={14} style={{ opacity: 0.7 }} />
                       </span>
@@ -1033,8 +1033,8 @@ function App() {
 
                   {/* Row 2: End Window and MAP toggles */}
                   <div className="flex-row" style={{ gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} title="Duration of the analysis window after the comment (Transition for Method 1, Standing for Method 2).">
-                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }} title="Duration of the analysis window after the comment (Transition comment for Method 1 and Standing for Method 2).">
                         End Window
                         <Info size={14} style={{ opacity: 0.7 }} />
                       </span>

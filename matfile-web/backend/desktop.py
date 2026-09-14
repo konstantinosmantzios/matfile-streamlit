@@ -1,28 +1,41 @@
 import threading
 import time
+import socket
 import uvicorn
 import webview
 from main import app, cleanup_all_temp_files
 
-def start_server():
-    # Start the FastAPI server on localhost:8000
-    # log_level="error" reduces the terminal noise from uvicorn
-    uvicorn.run(app, host="127.0.0.1", port=8000, log_level="warning")
+def find_free_port(start_port=8000):
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(('127.0.0.1', start_port))
+        return start_port
+    except OSError:
+        sock.bind(('127.0.0.1', 0))
+        return sock.getsockname()[1]
+    finally:
+        sock.close()
+
+def start_server(port):
+    uvicorn.run(app, host="127.0.0.1", port=port, log_level="warning")
 
 if __name__ == '__main__':
+    port = find_free_port(8000)
+
     # 1. Start the server in a separate daemon thread
-    server_thread = threading.Thread(target=start_server, daemon=True)
+    server_thread = threading.Thread(target=start_server, args=(port,), daemon=True)
     server_thread.start()
     
     # 2. Give the server a moment to start
-    time.sleep(1.5)
+    time.sleep(1.2)
     
     # 3. Create and start the PyWebView window
     window = webview.create_window(
-        title="Matfile Web App",
-        url="http://127.0.0.1:8000",
-        width=1200,
-        height=800,
+        title="FAMELab Mat File Viewer",
+        url=f"http://127.0.0.1:{port}",
+        width=1280,
+        height=850,
+        min_size=(900, 600),
         resizable=True
     )
     

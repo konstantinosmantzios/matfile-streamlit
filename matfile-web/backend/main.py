@@ -1,3 +1,4 @@
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -14,7 +15,8 @@ import gc
 import time
 import hashlib
 import json
-import asyncio
+import sys
+import tempfile
 import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -36,7 +38,12 @@ from lttb import lttb_downsample
 # Constants
 # ---------------------------------------------------------------------------
 BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
-TEMP_DIR = os.path.join(BACKEND_DIR, "temp")
+if "__compiled__" in globals() or getattr(sys, "frozen", False):
+    TEMP_DIR = os.path.join(tempfile.gettempdir(), "matfile_web_temp")
+else:
+    TEMP_DIR = os.path.join(BACKEND_DIR, "temp")
+os.makedirs(TEMP_DIR, exist_ok=True)
+
 SESSION_TTL_SECONDS = 30 * 60   # 30 minutes
 MAX_SESSIONS = 5
 TARGET_POINTS_DEFAULT = 3000
@@ -1454,8 +1461,31 @@ async def export_data(payload: dict):
 # ===================================================================
 #  Serve Frontend Static Files
 # ===================================================================
-frontend_dist = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "frontend", "dist"))
-if os.path.isdir(frontend_dist):
+def _resolve_frontend_dist():
+    candidates = [
+        # 1. Standard development layout: ../frontend/dist
+        os.path.abspath(os.path.join(BACKEND_DIR, "..", "frontend", "dist")),
+        # 2. Bundled inside distribution folder (standalone mode):
+        os.path.abspath(os.path.join(BACKEND_DIR, "frontend_dist")),
+        os.path.abspath(os.path.join(BACKEND_DIR, "dist")),
+    ]
+    if hasattr(sys, "executable") and sys.executable:
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.extend([
+            os.path.join(exe_dir, "frontend_dist"),
+            os.path.join(exe_dir, "dist"),
+            # macOS .app bundle structure (Contents/Resources)
+            os.path.abspath(os.path.join(exe_dir, "..", "Resources", "frontend_dist")),
+            os.path.abspath(os.path.join(exe_dir, "..", "Resources", "dist")),
+        ])
+    for p in candidates:
+        if os.path.isdir(p) and os.path.isfile(os.path.join(p, "index.html")):
+            return p
+    return candidates[0]
+
+frontend_dist = _resolve_frontend_dist()
+if os.path.isdir(frontend_dist) and os.path.isfile(os.path.join(frontend_dist, "index.html")):
+    print(f"[INFO] Serving frontend static files from: {frontend_dist}")
     app.mount("/", StaticFiles(directory=frontend_dist, html=True), name="static")
 else:
     print(f"[WARNING] Frontend dist directory not found at {frontend_dist}.")
