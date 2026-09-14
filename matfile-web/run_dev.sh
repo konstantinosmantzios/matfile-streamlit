@@ -4,9 +4,13 @@ echo "========================================="
 echo " Starting Matfile Development Servers... "
 echo "========================================="
 
-# Trap SIGINT and SIGTERM so that when you press Ctrl+C, 
-# it kills both background processes properly.
-trap 'kill 0' SIGINT SIGTERM EXIT
+# Trap SIGINT, SIGTERM, and EXIT to clean up temp files and kill child processes
+cleanup() {
+    echo -e "\n[System] Stopping servers and cleaning temporary session files..."
+    rm -f backend/temp/*.parquet backend/temp/*.mat 2>/dev/null || true
+    kill 0 2>/dev/null || true
+}
+trap cleanup SIGINT SIGTERM EXIT
 
 # Ensure port 8000 is free before starting
 echo "[System] Freeing port 8000..."

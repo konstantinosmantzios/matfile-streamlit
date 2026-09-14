@@ -2,7 +2,7 @@ import threading
 import time
 import uvicorn
 import webview
-from main import app
+from main import app, cleanup_all_temp_files
 
 def start_server():
     # Start the FastAPI server on localhost:8000
@@ -26,5 +26,9 @@ if __name__ == '__main__':
         resizable=True
     )
     
-    # Start the webview application loop
-    webview.start()
+    try:
+        # Start the webview application loop
+        webview.start()
+    finally:
+        print("[DESKTOP] Window closed by user. Cleaning up session files...")
+        cleanup_all_temp_files()

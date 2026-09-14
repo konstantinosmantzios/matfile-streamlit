@@ -314,7 +314,7 @@ def extract_channel_signals_with_comments(mat, df_comments, start_s=None, end_s=
     data_flat = mat["data"].ravel()
     blocktimes = np.atleast_1d(mat["blocktimes"])
 
-    EXCLUDE = {"Channel 24", "Channel 25", "Channel 26"}
+    EXCLUDE = {"Channel 24", "Channel 25", "Channel 26", "3: Systolic", "4: Diastolic", "7: SV", "8: CO", "9: TPR"}
     valid_channels = df_channels[
         (df_channels["samplerate"] > 0) & (~df_channels["title"].isin(EXCLUDE))
     ]

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import axios from 'axios';
-import { Activity, UploadCloud, Download, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Target, X } from 'lucide-react';
+import { Activity, UploadCloud, Download, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Target, X, Info } from 'lucide-react';
 import Plot from 'react-plotly.js';
 import FilterSandbox from './components/FilterSandbox';
 
@@ -114,6 +114,22 @@ function App() {
   });
 
   useEffect(() => { latestSessionIdRef.current = sessionId; }, [sessionId]);
+
+  // Cleanup session files on browser window/tab close or refresh
+  useEffect(() => {
+    const handleBeforeUnload = () => {
+      if (sessionId) {
+        const url = `${API_BASE_URL}/cleanup?session_id=${sessionId}`;
+        if (navigator.sendBeacon) {
+          navigator.sendBeacon(url);
+        } else {
+          fetch(url, { method: 'POST', keepalive: true }).catch(() => {});
+        }
+      }
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [sessionId]);
 
   const handleApplyAnalysisSettings = () => {
     setSettings(prev => ({
@@ -360,6 +376,11 @@ function App() {
     setError('');
     setAnalysisStats([]);
     
+    // Clean up previous session from server disk if uploading a new file
+    if (sessionId) {
+      axios.post(`${API_BASE_URL}/cleanup?session_id=${sessionId}`).catch(() => {});
+    }
+
     const formData = new FormData();
     formData.append('file', file);
     try {
@@ -488,7 +509,9 @@ function App() {
       const url = window.URL.createObjectURL(new Blob([response.data]));
       const link = document.createElement('a');
       link.href = url;
-      const dateStr = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+      const pad = (n) => String(n).padStart(2, '0');
+      const now = new Date();
+      const dateStr = `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}_${pad(now.getHours())}-${pad(now.getMinutes())}-${pad(now.getSeconds())}`;
       const cleanName = fileName.replace(/\.(mat|parquet|csv)$/i, '');
       link.setAttribute('download', `Analysis_${cleanName}_${dateStr}.xlsx`);
       document.body.appendChild(link);
@@ -698,7 +721,7 @@ function App() {
           <div className="flex-between" style={{ padding: '16px 24px' }}>
             <div className="flex-row">
               <Activity size={24} color="var(--accent-blue)" />
-              <h1 style={{ margin: 0 }}>MAT Analyzer</h1>
+              <h1 style={{ margin: 0 }}>FAMELab Mat File Viewer/Analyzer</h1>
               
               {/* Memory & Resolution Badges */}
               <div className="flex-row" style={{ marginLeft: 16 }}>
@@ -965,10 +988,14 @@ function App() {
 
               {/* Analysis Settings Row */}
               {analysisView === 'Supine to Standing Analysis' && (
-                <div className="glass-panel flex-row" style={{ width: '100%', justifyContent: 'space-between', padding: '12px 20px', marginTop: 16, gap: 16, flexWrap: 'wrap' }}>
-                  <div className="flex-row" style={{ gap: 24 }}>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>Baseline Window:</span>
+                <div className="glass-panel" style={{ width: '100%', padding: '12px 20px', marginTop: 16, display: 'flex', flexDirection: 'column', gap: 16 }}>
+                  {/* Row 1: Baseline settings and Apply */}
+                  <div className="flex-row" style={{ gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} title="Duration of the baseline value (blue line) before the comment selected in 'Baseline Ends At'. Used for the Baseline-based method.">
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                        Baseline Window
+                        <Info size={14} style={{ opacity: 0.7 }} />
+                      </span>
                       <div style={{ display: 'flex', alignItems: 'center', background: 'var(--bg-main)', border: '1px solid var(--border-color)', borderRadius: 6, padding: '2px 8px' }}>
                         <input 
                           type="number"
@@ -980,8 +1007,11 @@ function App() {
                       </div>
                     </div>
 
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>Ends At:</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} title="The reference comment point to calculate the baseline value before it. Used for the Baseline-based method.">
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                        Baseline Ends At
+                        <Info size={14} style={{ opacity: 0.7 }} />
+                      </span>
                       <select 
                         value={localAnalysisSettings.baselineEndComment}
                         onChange={e => setLocalAnalysisSettings(prev => ({ ...prev, baselineEndComment: e.target.value }))}
@@ -992,8 +1022,22 @@ function App() {
                       </select>
                     </div>
 
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)' }}>End Window:</span>
+                    <button 
+                      className="btn btn-primary" 
+                      onClick={handleApplyAnalysisSettings}
+                      style={{ padding: '6px 12px', fontSize: 13, borderRadius: 6 }}
+                    >
+                      Apply Settings
+                    </button>
+                  </div>
+
+                  {/* Row 2: End Window and MAP toggles */}
+                  <div className="flex-row" style={{ gap: 24, flexWrap: 'wrap', alignItems: 'center' }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }} title="Duration of the analysis window after the comment (Transition for Method 1, Standing for Method 2).">
+                      <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-muted)', display: 'flex', alignItems: 'center', gap: 4 }}>
+                        End Window
+                        <Info size={14} style={{ opacity: 0.7 }} />
+                      </span>
                       <div style={{ display: 'flex', alignItems: 'center', background: 'var(--bg-main)', border: '1px solid var(--border-color)', borderRadius: 6, padding: '2px 8px' }}>
                         <input 
                           type="number"
@@ -1004,39 +1048,36 @@ function App() {
                         <span style={{ fontSize: 12, color: 'var(--text-muted)', marginLeft: 4 }}>sec</span>
                       </div>
                     </div>
-                    
-                    <button 
-                      className="btn btn-primary" 
-                      onClick={handleApplyAnalysisSettings}
-                      style={{ padding: '6px 12px', fontSize: 13, borderRadius: 6 }}
-                    >
-                      Apply Settings
-                    </button>
-                  </div>
 
-                  {settings.selectedSignal && settings.selectedSignal.includes('Finger Pressure') && (
-                    <div className="flex-row" style={{ gap: 16 }}>
-                      <div style={{ width: '1px', height: '20px', background: 'var(--border-color)' }}></div>
-                      <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-main)', display: 'flex', alignItems: 'center', cursor: 'pointer', gap: 8, background: settings.useMapGaussianForStats ? 'rgba(234, 88, 12, 0.05)' : 'transparent', padding: '6px 12px', borderRadius: 8, transition: 'all 0.2s', border: settings.useMapGaussianForStats ? '1px solid rgba(234, 88, 12, 0.2)' : '1px solid transparent' }}>
-                        <input 
-                          type="checkbox" 
-                          style={{ accentColor: '#ea580c', width: '16px', height: '16px', cursor: 'pointer' }}
-                          checked={settings.useMapGaussianForStats} 
-                          onChange={e => setSettings(prev => ({ ...prev, useMapGaussianForStats: e.target.checked }))} 
-                        />
-                        Use MAP - Gaussian (5sec)
-                      </label>
-                      <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-main)', display: 'flex', alignItems: 'center', cursor: 'pointer', gap: 8, background: compareGaussian ? 'rgba(59, 130, 246, 0.05)' : 'transparent', padding: '6px 12px', borderRadius: 8, transition: 'all 0.2s', border: compareGaussian ? '1px solid rgba(59, 130, 246, 0.2)' : '1px solid transparent' }}>
-                        <input 
-                          type="checkbox" 
-                          style={{ accentColor: 'var(--accent-blue)', width: '16px', height: '16px', cursor: 'pointer' }}
-                          checked={compareGaussian} 
-                          onChange={e => setCompareGaussian(e.target.checked)} 
-                        />
-                        Show MAP - Gaussian (5sec)
-                      </label>
-                    </div>
-                  )}
+                    {settings.selectedSignal && settings.selectedSignal.includes('Finger Pressure') && (
+                      <div className="flex-row" style={{ gap: 16 }}>
+                        <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-main)', display: 'flex', alignItems: 'center', cursor: 'pointer', gap: 8, background: settings.useMapGaussianForStats ? 'rgba(234, 88, 12, 0.05)' : 'transparent', padding: '6px 12px', borderRadius: 8, transition: 'all 0.2s', border: settings.useMapGaussianForStats ? '1px solid rgba(234, 88, 12, 0.2)' : '1px solid transparent' }} title="Use MAP - Gaussian (5sec) for calculating minimum/maximum and endpoints.">
+                          <input 
+                            type="checkbox" 
+                            style={{ accentColor: '#ea580c', width: '16px', height: '16px', cursor: 'pointer' }}
+                            checked={settings.useMapGaussianForStats} 
+                            onChange={e => {
+                              const isChecked = e.target.checked;
+                              setSettings(prev => ({ ...prev, useMapGaussianForStats: isChecked }));
+                              if (isChecked) {
+                                setCompareGaussian(true);
+                              }
+                            }} 
+                          />
+                          Use MAP - Gaussian (5sec)
+                        </label>
+                        <label style={{ fontSize: 13, fontWeight: 600, color: 'var(--text-main)', display: 'flex', alignItems: 'center', cursor: 'pointer', gap: 8, background: compareGaussian ? 'rgba(59, 130, 246, 0.05)' : 'transparent', padding: '6px 12px', borderRadius: 8, transition: 'all 0.2s', border: compareGaussian ? '1px solid rgba(59, 130, 246, 0.2)' : '1px solid transparent' }} title="Show MAP - Gaussian (5sec) on the chart.">
+                          <input 
+                            type="checkbox" 
+                            style={{ accentColor: 'var(--accent-blue)', width: '16px', height: '16px', cursor: 'pointer' }}
+                            checked={compareGaussian} 
+                            onChange={e => setCompareGaussian(e.target.checked)} 
+                          />
+                          Show MAP - Gaussian (5sec)
+                        </label>
+                      </div>
+                    )}
+                  </div>
                 </div>
               )}
               {plotData.length > 0 ? (

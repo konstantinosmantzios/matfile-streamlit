@@ -1,5 +1,5 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 import io
 import scipy.io
@@ -35,7 +35,8 @@ from lttb import lttb_downsample
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-TEMP_DIR = "temp"
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMP_DIR = os.path.join(BACKEND_DIR, "temp")
 SESSION_TTL_SECONDS = 30 * 60   # 30 minutes
 MAX_SESSIONS = 5
 TARGET_POINTS_DEFAULT = 3000
@@ -95,20 +96,31 @@ def insert_gaps(t, y, gap_ms=5000.0):
     y_out = np.insert(y.astype(float), gap_indices + 1, np.nan)
     return t_out, y_out
 
+def cleanup_all_temp_files():
+    """Remove all temporary parquet and mat files in TEMP_DIR."""
+    if os.path.exists(TEMP_DIR):
+        for f in os.listdir(TEMP_DIR):
+            fpath = os.path.join(TEMP_DIR, f)
+            if os.path.isfile(fpath) and (f.endswith(".parquet") or f.endswith(".mat")):
+                try:
+                    os.remove(fpath)
+                except OSError:
+                    pass
+    gc.collect()
+
 def _cleanup_session(session_id: str):
-    """Delete all files and in-memory data for a session."""
+    """Delete all files on disk and in-memory data for a session."""
     session = SESSION_STORE.pop(session_id, None)
-    if session is None:
-        return
-    for key in ("raw_parquet_path", "processed_parquet_path", "file_path"):
-        path = session.get(key)
-        if path and os.path.exists(path):
+    if session_id and os.path.exists(TEMP_DIR):
+        import glob
+        pattern = os.path.join(TEMP_DIR, f"{session_id}*")
+        for fpath in glob.glob(pattern):
             try:
-                os.remove(path)
+                os.remove(fpath)
             except OSError:
                 pass
     gc.collect()
-    print(f"[CLEANUP] session {session_id[:8]} removed")
+    print(f"[CLEANUP] session {session_id[:8]} removed from memory and disk")
 
 # ---------------------------------------------------------------------------
 # App & Lifecycle
@@ -116,7 +128,7 @@ def _cleanup_session(session_id: str):
 SESSION_STORE: dict = {}
 
 async def _session_reaper():
-    """Background loop that removes expired sessions."""
+    """Background loop that removes expired sessions and orphaned temp files."""
     while True:
         await asyncio.sleep(60)
         now = time.time()
@@ -127,15 +139,28 @@ async def _session_reaper():
         for sid in expired:
             print(f"[REAPER] session {sid[:8]} expired")
             _cleanup_session(sid)
+            
+        # Sweep disk for orphaned temp files older than TTL
+        if os.path.exists(TEMP_DIR):
+            for fname in os.listdir(TEMP_DIR):
+                fpath = os.path.join(TEMP_DIR, fname)
+                try:
+                    if os.path.isfile(fpath) and (now - os.path.getmtime(fpath) > SESSION_TTL_SECONDS):
+                        os.remove(fpath)
+                        print(f"[REAPER] Removed orphaned temp file {fname}")
+                except OSError:
+                    pass
 
 @asynccontextmanager
 async def lifespan(app):
     os.makedirs(TEMP_DIR, exist_ok=True)
+    # Clean up any leftover temporary files from previous runs on startup
+    cleanup_all_temp_files()
     reaper = asyncio.create_task(_session_reaper())
     yield
     reaper.cancel()
-    for sid in list(SESSION_STORE.keys()):
-        _cleanup_session(sid)
+    # Clean up all temporary files on shutdown
+    cleanup_all_temp_files()
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(
@@ -176,6 +201,23 @@ async def get_memory():
 async def receive_debug(payload: dict):
     msg = payload.get("message", "")
     print(msg)
+    return {"status": "ok"}
+
+# ===================================================================
+#  POST / GET  /api/cleanup
+# ===================================================================
+@app.post("/api/cleanup")
+@app.get("/api/cleanup")
+async def cleanup_endpoint(request: Request):
+    sid = request.query_params.get("session_id")
+    if not sid and request.method == "POST":
+        try:
+            body = await request.json()
+            sid = body.get("session_id")
+        except Exception:
+            pass
+    if sid:
+        _cleanup_session(sid)
     return {"status": "ok"}
 
 @app.post("/api/upload")
@@ -1397,8 +1439,9 @@ async def export_data(payload: dict):
         del df_sorted, result_df, agg5_moving_map
         gc.collect()
 
+        local_now = time.strftime("%Y-%m-%d_%H-%M-%S")
         headers = {
-            "Content-Disposition": 'attachment; filename="matfile_analysis.xlsx"'
+            "Content-Disposition": f'attachment; filename="matfile_analysis_{local_now}.xlsx"'
         }
         return StreamingResponse(
             output, headers=headers,
