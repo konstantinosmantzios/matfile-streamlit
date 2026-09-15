@@ -13,24 +13,38 @@ def _to_ms(t_val):
     return int(s.astype("int64").values[0] // 1_000_000)
 
 
-def _interp_t_to_ms(t_s, resampled_x, resampled_t):
-    """Interpolate the absolute timestamp (for Plotly ms) at an exact time_s value.
-    Uses linear interpolation between the two nearest beat-averaged timestamps."""
-    import tzlocal
-    local_tz = tzlocal.get_localzone_name()
+def _datetime_to_ms_array(dt_arr):
+    """Vectorized epoch-ms (and ns) conversion for an array of (naive, wall-clock)
+    datetimes, honoring the local tz offset applied by _to_ms per point.
+    Returns (ms int64 array, ns float64 array or None)."""
+    arr = np.asarray(dt_arr)
+    if arr.dtype.kind != "M":
+        ms = np.array([_to_ms(v) for v in np.atleast_1d(arr)], dtype=np.int64)
+        return ms, None
+    naive_ms = arr.astype("datetime64[ms]").astype(np.int64)
+    off = 0
+    valid = ~pd.isna(arr)
+    if valid.any():
+        i0 = int(np.argmax(valid))
+        off = _to_ms(arr[i0]) - int(naive_ms[i0])
+        if off != 0:
+            naive_ms = naive_ms + np.int64(off)
+    naive_ns = arr.astype("datetime64[ns]").astype(np.float64)
+    ns = naive_ns + np.float64(off) * 1_000_000.0
+    return naive_ms, ns
+
+
+def _interp_t_to_ms(t_s, resampled_x, t_ms_all, t_ns_all=None):
+    """Interpolate the absolute timestamp (Plotly ms) at an exact time_s value.
+    Matches the historic ns-domain interpolation + floor when t_ns_all is given."""
     if len(resampled_x) == 0:
         return None
-    # Convert resampled_t (datetime64) to float64 unix-ns for interpolation
-    t_ns = resampled_t.astype("datetime64[ns]").astype(np.float64)
-    interp_ns = np.interp(t_s, resampled_x, t_ns)
-    # Reconstruct as naive timestamp then localize
-    naive_ts = pd.Timestamp(int(interp_ns), unit='ns')
-    local_ts = naive_ts.tz_localize(local_tz)
-    return int(local_ts.value // 1_000_000)
+    if t_ns_all is not None:
+        return int(np.interp(t_s, resampled_x, t_ns_all) // 1_000_000)
+    return int(np.interp(t_s, resampled_x, t_ms_all.astype(np.float64)))
 
 
-
-def _build_exact_segment(t_start_exact, t_end_exact, resampled_x, resampled_y, resampled_t):
+def _build_exact_segment(t_start_exact, t_end_exact, resampled_x, resampled_y, t_ms_all, t_ns_all=None, need_ms=True):
     """Build arrays for an analysis segment with interpolated boundary values.
     
     Returns (x_exact, y_exact, t_ms_exact) where:
@@ -40,10 +54,11 @@ def _build_exact_segment(t_start_exact, t_end_exact, resampled_x, resampled_y, r
     - Duplicate boundary points are removed
     - NaN values are excluded
     """
+    t_ms_exact = None
     # Interpolate boundary values on the beat-averaged signal
     finite_mask = np.isfinite(resampled_y)
     if not np.any(finite_mask):
-        return np.array([]), np.array([]), np.array([])
+        return np.array([]), np.array([]), ([] if need_ms else None)
     
     rx_valid = resampled_x[finite_mask]
     ry_valid = resampled_y[finite_mask]
@@ -55,23 +70,24 @@ def _build_exact_segment(t_start_exact, t_end_exact, resampled_x, resampled_y, r
     interior_mask = (resampled_x > t_start_exact) & (resampled_x < t_end_exact) & finite_mask
     x_interior = resampled_x[interior_mask]
     y_interior = resampled_y[interior_mask]
-    t_interior_idx = np.where(interior_mask)[0]
     
     # Build exact-boundary arrays
     x_exact = np.concatenate([[t_start_exact], x_interior, [t_end_exact]])
     y_exact = np.concatenate([[y_at_start], y_interior, [y_at_end]])
     
-    # Build ms timestamps: interpolate for boundaries, use actual for interior
-    ms_start = _interp_t_to_ms(t_start_exact, resampled_x, resampled_t)
-    ms_end = _interp_t_to_ms(t_end_exact, resampled_x, resampled_t)
-    ms_interior = [_to_ms(resampled_t[idx]) for idx in t_interior_idx]
-    t_ms_exact = [ms_start] + ms_interior + [ms_end]
-    
     # Deduplicate (if a beat point happens to coincide with boundary)
     unique_mask = np.concatenate([[True], np.diff(x_exact) > 1e-9])
     x_exact = x_exact[unique_mask]
     y_exact = y_exact[unique_mask]
-    t_ms_exact = [t_ms_exact[i] for i, m in enumerate(unique_mask) if m]
+    
+    if need_ms:
+        # Build ms timestamps: interp for boundaries, vectorized for interior.
+        t_interior_idx = np.where(interior_mask)[0]
+        ms_start = _interp_t_to_ms(t_start_exact, resampled_x, t_ms_all, t_ns_all)
+        ms_end = _interp_t_to_ms(t_end_exact, resampled_x, t_ms_all, t_ns_all)
+        ms_interior = t_ms_all[t_interior_idx]
+        t_ms_exact = np.concatenate([[ms_start], ms_interior, [ms_end]]).astype(np.int64)
+        t_ms_exact = t_ms_exact[unique_mask].tolist()
     
     return x_exact, y_exact, t_ms_exact
 
@@ -140,6 +156,31 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
     # Ensure arrays are float64 for interpolation
     resampled_x = np.asarray(resampled_x, dtype=np.float64)
     resampled_y = np.asarray(resampled_y, dtype=np.float64)
+
+    try:
+        t_ms_all, t_ns_all = _datetime_to_ms_array(resampled_t)
+        if t_ns_all is None or len(t_ns_all) != len(resampled_x):
+            t_ns_all = t_ms_all.astype(np.float64) * 1000.0
+    except Exception:
+        t_ms_all = np.array([_to_ms(dt) for dt in resampled_t], dtype=np.int64)
+        t_ns_all = t_ms_all.astype(np.float64) * 1000.0
+
+    # Hoisted once: finite sites used for interpolation throughout
+    finite_mask_all = np.isfinite(resampled_y)
+    rx_fin = resampled_x[finite_mask_all]
+    ry_fin = resampled_y[finite_mask_all]
+
+    # Vectorized ms for comment absolute times (avoids a slow pandas tz_localize
+    # per comment, which used to dominate on recordings with many markers).
+    try:
+        c_dt = pd.to_datetime([c.get("absolute_time") for c in comment_list]).values
+        c_ms_arr, _ = _datetime_to_ms_array(c_dt)
+        c_valid = ~pd.isna(c_dt)
+        c_ms_list = [
+            int(c_ms_arr[k]) if c_valid[k] else None for k in range(len(c_dt))
+        ]
+    except Exception:
+        c_ms_list = [_to_ms(c.get("absolute_time")) for c in comment_list]
         
     i = 0
     while i < len(comment_list):
@@ -151,8 +192,8 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                 t_stand = float(c_stand['time_s'])  # exact comment time
                 t_end_marker = t_stand + end_marker_window
                 
-                c1_ms = _to_ms(c1['absolute_time'])
-                c_stand_ms = _to_ms(c_stand['absolute_time'])
+                c1_ms = c_ms_list[i]
+                c_stand_ms = c_ms_list[i + 1]
                 
                 # Highlight Transition Region
                 shapes.append({
@@ -186,7 +227,7 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                 
                 # Build exact baseline segment with interpolated boundaries
                 x_base, y_base, t_ms_base = _build_exact_segment(
-                    t_base_start, t_base_end, resampled_x, resampled_y, resampled_t
+                    t_base_start, t_base_end, resampled_x, resampled_y, t_ms_all, t_ns_all
                 )
                 
                 baseline_mean = None
@@ -214,15 +255,11 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                 # ============================================================
                 
                 # Transition Start Marker (on the resampled line)
-                finite_mask_all = np.isfinite(resampled_y)
-                rx_fin = resampled_x[finite_mask_all]
-                ry_fin = resampled_y[finite_mask_all]
-                
                 trans_val_interp = float(np.interp(t_start, rx_fin, ry_fin)) if len(rx_fin) > 0 else np.nan
                 stand_val_interp = float(np.interp(t_stand, rx_fin, ry_fin)) if len(rx_fin) > 0 else np.nan
                 end_val_interp = float(np.interp(t_end_marker, rx_fin, ry_fin)) if len(rx_fin) > 0 else np.nan
                 
-                t_start_ms_interp = _interp_t_to_ms(t_start, resampled_x, resampled_t)
+                t_start_ms_interp = _interp_t_to_ms(t_start, resampled_x, t_ms_all, t_ns_all)
                 if t_start_ms_interp is not None and np.isfinite(trans_val_interp):
                     traces.append({
                         "x": [t_start_ms_interp],
@@ -235,7 +272,7 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                     })
                     
                 # Stand Start Marker
-                t_stand_ms_interp = _interp_t_to_ms(t_stand, resampled_x, resampled_t)
+                t_stand_ms_interp = _interp_t_to_ms(t_stand, resampled_x, t_ms_all, t_ns_all)
                 if t_stand_ms_interp is not None and np.isfinite(stand_val_interp):
                     traces.append({
                         "x": [t_stand_ms_interp],
@@ -248,7 +285,7 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                     })
                     
                 # End Marker
-                t_end_marker_ms_interp = _interp_t_to_ms(t_end_marker, resampled_x, resampled_t)
+                t_end_marker_ms_interp = _interp_t_to_ms(t_end_marker, resampled_x, t_ms_all, t_ns_all)
                 if t_end_marker_ms_interp is not None and np.isfinite(end_val_interp):
                     traces.append({
                         "x": [t_end_marker_ms_interp],
@@ -271,7 +308,7 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                 
                 # Build exact segment for orange area
                 x_or, y_or, t_ms_or = _build_exact_segment(
-                    t_start, t_end_marker, resampled_x, resampled_y, resampled_t
+                    t_start, t_end_marker, resampled_x, resampled_y, t_ms_all, t_ns_all
                 )
                 
                 if len(x_or) > 1:
@@ -328,7 +365,7 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                 min_val_gr, pct_drop_gr = np.nan, np.nan
                 
                 x_gr, y_gr, t_ms_gr = _build_exact_segment(
-                    t_stand, t_end_marker, resampled_x, resampled_y, resampled_t
+                    t_stand, t_end_marker, resampled_x, resampled_y, t_ms_all, t_ns_all
                 )
                 
                 if len(x_gr) > 1:
@@ -389,144 +426,126 @@ def generate_analysis_viz(main_signal, resampled_x, resampled_y, resampled_t,
                 rec_end_val_interp = None
                 
                 if baseline_mean is not None:
-                    finite_mask_all = np.isfinite(resampled_y)
                     if np.any(finite_mask_all):
                         t_end_data = float(resampled_x[finite_mask_all][-1])
                         # Bound t_end_data to not go past our array
                         t_end_data = max(t_start, t_end_data)
                         
-                        x_post, y_post, t_ms_post = _build_exact_segment(t_start, t_end_data, resampled_x, resampled_y, resampled_t)
+                        def _interp_cross(x0, y0, x1, y1, y_target):
+                            if y1 == y0: return x0
+                            return x0 + (y_target - y0) * (x1 - x0) / (y1 - y0)
                         
-                        if len(x_post) > 0:
-                            def _interp_cross(x0, y0, x1, y1, y_target):
-                                if y1 == y0: return x0
-                                return x0 + (y_target - y0) * (x1 - x0) / (y1 - y0)
-                                
-                            t_search_start = t_start
-                            t_rec_start = None
-                            t_rec_end = None
-                            
-                            while True:
-                                x_post, y_post, _ = _build_exact_segment(t_search_start, t_end_data, resampled_x, resampled_y, resampled_t)
-                                if len(x_post) < 2:
-                                    break
-                                
-                                # Find where curve crosses DOWN the baseline value (y_prev >= baseline_mean and y_curr < baseline_mean)
-                                down_cross = np.where((y_post[:-1] >= baseline_mean) & (y_post[1:] < baseline_mean))[0]
-                                if len(down_cross) == 0:
-                                    break
-                                
-                                drop_idx = down_cross[0]
-                                candidate_start = _interp_cross(x_post[drop_idx], y_post[drop_idx], x_post[drop_idx+1], y_post[drop_idx+1], baseline_mean)
-                                    
-                                x_rem, y_rem, _ = _build_exact_segment(candidate_start, t_end_data, resampled_x, resampled_y, resampled_t)
-                                if len(x_rem) < 2:
-                                    break
-
-                                # Find where curve crosses UP the baseline value (y_prev < baseline_mean and y_curr >= baseline_mean)
-                                up_cross = np.where((y_rem[:-1] < baseline_mean) & (y_rem[1:] >= baseline_mean))[0]
-                                
-                                if len(up_cross) > 0:
-                                    end_idx = up_cross[0]
-                                    candidate_end = _interp_cross(x_rem[end_idx], y_rem[end_idx], x_rem[end_idx+1], y_rem[end_idx+1], baseline_mean)
-                                    
-                                    # Dip must last at least 0.5 seconds
-                                    if candidate_end - candidate_start >= 0.5:
-                                        if candidate_start <= t_start + 20:
-                                            t_rec_start = candidate_start
-                                            if candidate_end <= t_stand + 30:
-                                                t_rec_end = candidate_end
-                                        break # Stop searching after finding the first valid-length dip
-                                    else:
-                                        # Too short, advance search past this crossing
-                                        t_search_start = max(candidate_end, candidate_start + 0.5)
+                        # One vectorized pass over the whole beat series: find every
+                        # down/up baseline crossing. (Previously the search re-built a
+                        # full-tail segment per 0.5s step visit, which was O(n^2) and
+                        # took seconds+ on oscillating signals with many crossings.)
+                        below = (resampled_y < baseline_mean) & finite_mask_all
+                        b0, b1 = below[:-1], below[1:]
+                        down_idx = np.where((b0 == False) & b1)[0]
+                        up_idx = np.where(b0 & (b1 == False))[0]
+                        
+                        def _cross_pos(idx_arr, xa, ya):
+                            x0, x1 = xa[idx_arr], xa[idx_arr + 1]
+                            y0, y1 = ya[idx_arr], ya[idx_arr + 1]
+                            den = y1 - y0
+                            with np.errstate(divide="ignore"):
+                                frac = np.where(den == 0, 0.0, (baseline_mean - y0) / den)
+                            return x0 + frac * (x1 - x0)
+                        
+                        down_pos = _cross_pos(down_idx, resampled_x, resampled_y)
+                        up_pos = _cross_pos(up_idx, resampled_x, resampled_y)
+                        
+                        t_rec_start = None
+                        t_rec_end = None
+                        t_search_start = t_start
+                        
+                        kd = int(np.searchsorted(down_pos, t_search_start))
+                        while kd < len(down_pos):
+                            candidate_start = float(down_pos[kd])
+                            ku = int(np.searchsorted(up_pos, candidate_start))
+                            if ku < len(up_pos):
+                                candidate_end = float(up_pos[ku])
+                                # Dip must last at least 0.5 seconds
+                                if candidate_end - candidate_start >= 0.5:
+                                    if candidate_start <= t_start + 20:
+                                        t_rec_start = candidate_start
+                                        if candidate_end <= t_stand + 30:
+                                            t_rec_end = candidate_end
+                                    break # Stop searching after finding the first valid-length dip
                                 else:
-                                    # Never recovers above baseline before end of data
-                                    if t_end_data - candidate_start >= 0.5:
-                                        if candidate_start <= t_start + 20:
-                                            t_rec_start = candidate_start
-                                    break
-                                    
-                            # Check for manual override
-                            if end_marker_overrides and str(i) in end_marker_overrides:
-                                override_ms = end_marker_overrides[str(i)]
-                                # Calculate resampled_t in unix ms once if needed
-                                resampled_t_ms = np.array([_to_ms(dt) for dt in resampled_t])
-                                t_rec_end_override = float(np.interp(override_ms, resampled_t_ms, resampled_x))
-                                
-                                # Apply override
-                                t_rec_end = t_rec_end_override
-                                # If t_rec_start wasn't detected (e.g. baseline crossed late), we still need it.
-                                # Usually if there's an end marker, there should be a start marker.
-                                # If it wasn't detected by the 20s rule, we can relax it if an override exists.
-                                if t_rec_start is None:
-                                    down_cross_all = np.where((resampled_x[:-1] >= t_start) & (resampled_y[:-1] >= baseline_mean) & (resampled_y[1:] < baseline_mean))[0]
-                                    if len(down_cross_all) > 0:
-                                        idx = down_cross_all[0]
-                                        t_rec_start = float(_interp_cross(resampled_x[idx], resampled_y[idx], resampled_x[idx+1], resampled_y[idx+1], baseline_mean))
+                                    # Too short, advance search past this crossing
+                                    t_search_start = max(candidate_end, candidate_start + 0.5)
+                                    kd = int(np.searchsorted(down_pos, t_search_start))
+                            else:
+                                # Never recovers above baseline before end of data
+                                if t_end_data - candidate_start >= 0.5:
+                                    if candidate_start <= t_start + 20:
+                                        t_rec_start = candidate_start
+                                break
 
-                                    
-                            if t_rec_start is not None:
-                                # Always plot the start marker if found within 20s
-                                t_rec_start_ms_interp = _interp_t_to_ms(t_rec_start, resampled_x, resampled_t)
-                                start_val_interp = float(np.interp(t_rec_start, resampled_x, resampled_y))
+                        # Check for manual override
+                        if end_marker_overrides and str(i) in end_marker_overrides:
+                            override_ms = end_marker_overrides[str(i)]
+                            t_rec_end_override = float(np.interp(override_ms, t_ms_all.astype(np.float64), resampled_x))
+                            t_rec_end = t_rec_end_override
+                            if t_rec_start is None:
+                                down_cross_all = np.where((resampled_x[:-1] >= t_start) & (resampled_y[:-1] >= baseline_mean) & (resampled_y[1:] < baseline_mean))[0]
+                                if len(down_cross_all) > 0:
+                                    idx = down_cross_all[0]
+                                    t_rec_start = float(_interp_cross(resampled_x[idx], resampled_y[idx], resampled_x[idx+1], resampled_y[idx+1], baseline_mean))
+
+                        if t_rec_start is not None:
+                            # Always plot the start marker if found within 20s
+                            t_rec_start_ms_interp = _interp_t_to_ms(t_rec_start, resampled_x, t_ms_all, t_ns_all)
+                            start_val_interp = float(np.interp(t_rec_start, resampled_x, resampled_y))
+                            traces.append({
+                                "x": [t_rec_start_ms_interp],
+                                "y": [start_val_interp],
+                                "mode": "markers",
+                                "name": "Rec Start",
+                                "marker": {"color": "#3b82f6", "size": 13, "symbol": "triangle-down"},
+                                "showlegend": False,
+                                "hoverinfo": "skip"
+                            })
+
+                        if t_rec_start is not None and t_rec_end is not None:
+                            t_rec_end_ms_interp = _interp_t_to_ms(t_rec_end, resampled_x, t_ms_all, t_ns_all)
+                            rec_end_val_interp = float(np.interp(t_rec_end, rx_fin, ry_fin)) if len(rx_fin) > 0 else np.nan
+                            rec_duration = t_rec_end - t_rec_start
+                            rec_started_in = "Transition" if t_rec_start < t_stand else "Standing"
+                            x_rec, y_rec, ms_rec = _build_exact_segment(t_rec_start, t_rec_end, resampled_x, resampled_y, t_ms_all, t_ns_all)
+                            if len(x_rec) > 1:
+                                rec_area = float(np.trapezoid(baseline_mean - y_rec, x_rec))
+                                rec_min_val = float(np.min(y_rec))
+                                if baseline_mean != 0:
+                                    rec_pct_drop = float((baseline_mean - rec_min_val) / abs(baseline_mean) * 100)
                                 traces.append({
-                                    "x": [t_rec_start_ms_interp],
-                                    "y": [start_val_interp],
+                                    "x": [ms_rec[-1]],
+                                    "y": [float(y_rec[-1])],
                                     "mode": "markers",
-                                    "name": "Rec Start",
-                                    "marker": {"color": "#3b82f6", "size": 13, "symbol": "triangle-down"},
+                                    "name": "Rec End",
+                                    "marker": {"color": "#3b82f6", "size": 13, "symbol": "triangle-up"},
                                     "showlegend": False,
                                     "hoverinfo": "skip"
                                 })
-
-                            if t_rec_start is not None and t_rec_end is not None:
-                                t_rec_end_ms_interp = _interp_t_to_ms(t_rec_end, resampled_x, resampled_t)
-                                
-                                finite_mask_all = np.isfinite(resampled_y)
-                                rx_fin = resampled_x[finite_mask_all]
-                                ry_fin = resampled_y[finite_mask_all]
-                                rec_end_val_interp = float(np.interp(t_rec_end, rx_fin, ry_fin)) if len(rx_fin) > 0 else np.nan
-                                
-                                rec_duration = t_rec_end - t_rec_start
-                                rec_started_in = "Transition" if t_rec_start < t_stand else "Standing"
-                                        
-                                x_rec, y_rec, ms_rec = _build_exact_segment(t_rec_start, t_rec_end, resampled_x, resampled_y, resampled_t)
-                                
-                                if len(x_rec) > 1:
-                                    rec_area = float(np.trapezoid(baseline_mean - y_rec, x_rec))
-                                    rec_min_val = float(np.min(y_rec))
-                                    if baseline_mean != 0:
-                                        rec_pct_drop = float((baseline_mean - rec_min_val) / abs(baseline_mean) * 100)
-                                    
-                                    # Visual traces (end marker and shading)
-                                    traces.append({
-                                        "x": [ms_rec[-1]],
-                                        "y": [float(y_rec[-1])],
-                                        "mode": "markers",
-                                        "name": "Rec End",
-                                        "marker": {"color": "#3b82f6", "size": 13, "symbol": "triangle-up"},
-                                        "showlegend": False,
-                                        "hoverinfo": "skip"
-                                    })
-                                    traces.append({
-                                        "x": ms_rec,
-                                        "y": [float(baseline_mean)] * len(ms_rec),
-                                        "mode": "lines",
-                                        "line": {"width": 0},
-                                        "showlegend": False,
-                                        "hoverinfo": "skip"
-                                    })
-                                    traces.append({
-                                        "x": ms_rec,
-                                        "y": [float(y) if np.isfinite(y) else None for y in y_rec],
-                                        "mode": "lines",
-                                        "line": {"width": 0},
-                                        "fill": "tonexty",
-                                        "fillcolor": "rgba(59, 130, 246, 0.3)", # Blue
-                                        "showlegend": False,
-                                        "hoverinfo": "skip"
-                                    })
+                                traces.append({
+                                    "x": ms_rec,
+                                    "y": [float(baseline_mean)] * len(ms_rec),
+                                    "mode": "lines",
+                                    "line": {"width": 0},
+                                    "showlegend": False,
+                                    "hoverinfo": "skip"
+                                })
+                                traces.append({
+                                    "x": ms_rec,
+                                    "y": [float(y) if np.isfinite(y) else None for y in y_rec],
+                                    "mode": "lines",
+                                    "line": {"width": 0},
+                                    "fill": "tonexty",
+                                    "fillcolor": "rgba(59, 130, 246, 0.3)",
+                                    "showlegend": False,
+                                    "hoverinfo": "skip"
+                                })
 
                 # ============================================================
                 # Summary Stats — using interpolated values and exact durations

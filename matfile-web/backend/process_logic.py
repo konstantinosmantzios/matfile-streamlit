@@ -2,13 +2,23 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta
 from processing import (
-    rolling_median_np, prepare_hr_for_window, compute_win_half_from_hr,
+    rolling_median_minp1, rolling_mad_minp1,
+    prepare_hr_for_window, compute_win_half_from_hr,
     find_local_high_indices, apply_savgol_filter, apply_butter_lowpass,
     apply_hampel_filter, find_autocal_column, first_nonempty_comment,
     estimate_dynamic_hr_array
 )
 
-def process_session_data(df_raw, df_channel_info, df_comments, settings, preview_only=False):
+def process_session_data(df_raw, df_channel_info, df_comments, settings, preview_only=False,
+                         cache_in=None, cache_out=None):
+    """Process raw session data into filtered + resampled frames.
+
+    cache_in / cache_out: optional dicts for reusing raw-only computations that
+    are independent of the filter settings (segment ids, HR cleaning + peak half
+    windows) across consecutive filter tweaks on the same time range.
+    """
+    cache_in = cache_in if cache_in is not None else {}
+    cache_out = cache_out if cache_out is not None else {}
     df_sorted = df_raw.sort_values('time_s').copy()
     all_signals = df_sorted.columns[df_sorted.columns.str.contains(':', regex=False)].tolist()
     
@@ -74,11 +84,13 @@ def process_session_data(df_raw, df_channel_info, df_comments, settings, preview
                             end_idx = min(len(df_sorted), idx_global + int(15 * fs))
                             mask[idx_global:end_idx] = True
 
-    # --- Convert to numeric and apply AutoCal mask ---
+    # --- Convert to numeric and apply AutoCal mask (skip already-numeric cols) ---
     for col in all_signals:
         if col != fallback_signal and col != autocal_col:
-            df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce').astype('float64')
+            if not pd.api.types.is_numeric_dtype(df_sorted[col]):
+                df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce')
             if col == priority_signal:
+                df_sorted[col] = df_sorted[col].astype('float64')
                 df_sorted.loc[mask, col] = np.nan
                 
     for bp_col in ["2: MAP", "3: Systolic", "4: Diastolic"]:
@@ -144,9 +156,12 @@ def process_session_data(df_raw, df_channel_info, df_comments, settings, preview
     else:
         fs_cbf = fs_main
 
-    # Convert to float32 for memory efficiency (after filtering is done in float64)
+    # Convert to float32 for memory efficiency (after filtering is done in float64).
+# astype on an already-float32 column is a no-copy view → cheap on cached raw frames.
     for col in all_signals:
-        df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce').astype('float32')
+        if not pd.api.types.is_numeric_dtype(df_sorted[col]):
+            df_sorted[col] = pd.to_numeric(df_sorted[col], errors='coerce')
+        df_sorted[col] = df_sorted[col].astype('float32')
 
     if preview_only:
         # Skip beat detection and resampling for faster preview
@@ -155,7 +170,6 @@ def process_session_data(df_raw, df_channel_info, df_comments, settings, preview
     # =========================================================================
     # STEP 2: Calculate segments and Resample
     # =========================================================================
-    df_sorted['segment_id'] = (df_sorted['absolute_time'].diff() > pd.Timedelta(seconds=1)).cumsum().astype('float32')
 
     # =========================================================================
     # STEP 2: Resampling (time-based or beat-based with peak detection)
@@ -163,8 +177,13 @@ def process_session_data(df_raw, df_channel_info, df_comments, settings, preview
     resample_mode = settings.get("resampleMode", "Time-based")
     beat_mode = (resample_mode == "Beat-based")
     
-    # Identify segments based on large time gaps (> 1 second)
-    df_sorted['segment_id'] = (df_sorted['absolute_time'].diff() > pd.Timedelta(seconds=1)).cumsum()
+    # Identify segments based on large time gaps (> 1 second). Raw-only → cacheable.
+    seg_cache = cache_in.get("segment_id")
+    if seg_cache is not None and len(seg_cache) == len(df_sorted):
+        df_sorted['segment_id'] = seg_cache
+    else:
+        df_sorted['segment_id'] = (df_sorted['absolute_time'].diff() > pd.Timedelta(seconds=1)).cumsum()
+        cache_out["segment_id"] = df_sorted['segment_id'].values.copy()
     
     result_df = pd.DataFrame()
     agg5_moving_map = {}
@@ -194,43 +213,76 @@ def process_session_data(df_raw, df_channel_info, df_comments, settings, preview
         sig0_filtered = pd.to_numeric(df_sorted[main_signal], errors='coerce').astype('float64').values
         
         if "5: HR" in df_sorted.columns and not df_sorted["5: HR"].isna().all():
-            hr_raw = pd.to_numeric(df_sorted["5: HR"], errors='coerce').astype('float64').values
-            est_hr_arr = estimate_dynamic_hr_array(sig0_filtered, fs0)
-            hr_raw = np.where(np.isnan(hr_raw) | (hr_raw <= 0), est_hr_arr, hr_raw)
+            hr_src = pd.to_numeric(df_sorted["5: HR"], errors='coerce').astype('float64').values
+            hr_used_est = bool(np.isnan(hr_src).any() or (hr_src <= 0).any())
         else:
-            hr_raw = estimate_dynamic_hr_array(sig0_filtered, fs0)
+            hr_src = None
+            hr_used_est = True
 
-        # --- Clean HR: Hampel spike removal then rolling-median smoothing ---
-        # Step 1: Hampel filter – replace ±3σ-MAD outliers with local median (window ≈ 1 s at fs0)
-        def _odd(n): return max(5, int(n) if int(n) % 2 == 1 else int(n) + 1)
-        hampel_win = _odd(round(fs0 * 1.0))  # ≈ 1 s, must be odd
-        hr_series = pd.Series(hr_raw)
-        rolling_med = hr_series.rolling(hampel_win, center=True, min_periods=1).median()
-        rolling_mad = hr_series.rolling(hampel_win, center=True, min_periods=1).apply(
-            lambda x: np.median(np.abs(x - np.median(x))), raw=True
-        )
-        threshold = 3.0 * 1.4826 * rolling_mad
-        spike_mask = np.abs(hr_series - rolling_med) > threshold
-        hr_hampel = hr_series.copy()
-        hr_hampel[spike_mask] = rolling_med[spike_mask]
+        # ---- Clean HR: Hampel spike removal then rolling-median smoothing ----
+        # Raw-only when the HR channel is complete, so the result (incl. peak
+        # half-windows) is cacheable across filter tweaks.
+        hr_block_cache = cache_in.get("hr_block")
+        hr_block_ok = (hr_block_cache is not None
+                       and hr_block_cache.get("hr_smoothed") is not None
+                       and not hr_block_cache.get("uses_estimate")
+                       and not hr_used_est
+                       and len(hr_block_cache["hr_smoothed"]) == len(ts))
+        if hr_block_ok:
+            hr_smoothed = np.asarray(hr_block_cache["hr_smoothed"], dtype=np.float64)
+            win_half = np.asarray(hr_block_cache["win_half"], dtype=int)
+        else:
+            if hr_src is not None:
+                est_hr_arr = estimate_dynamic_hr_array(sig0_filtered, fs0)
+                hr_raw = np.where(np.isnan(hr_src) | (hr_src <= 0), est_hr_arr, hr_src)
+            else:
+                hr_raw = estimate_dynamic_hr_array(sig0_filtered, fs0)
 
-        # Step 2: Rolling-median smooth (≈ 5 s window) to remove remaining jitter
-        smooth_win = _odd(round(fs0 * 5.0))
-        hr_smoothed = hr_hampel.rolling(smooth_win, center=True, min_periods=1).median().to_numpy()
-        # Clip to physiological range
-        hr_smoothed = np.clip(hr_smoothed, 20.0, 250.0)
+            # Step 1: Hampel filter – replace ±3σ-MAD outliers with local median
+            # (window ≈ 1 s at fs0). Edges exact → matches old pandas min_periods=1.
+            def _odd(n): return max(5, int(n) if int(n) % 2 == 1 else int(n) + 1)
+            hampel_win = _odd(round(fs0 * 1.0))  # ≈ 1 s, must be odd
+            rolling_med = rolling_median_minp1(hr_raw, hampel_win)
+            rolling_mad = rolling_mad_minp1(hr_raw, hampel_win)
+            threshold = 3.0 * 1.4826 * rolling_mad
+            spike_mask = np.abs(hr_raw - rolling_med) > threshold
+            hr_hampel = hr_raw.copy()
+            hr_hampel[spike_mask] = rolling_med[spike_mask]
+            if np.isnan(hr_raw).any():
+                hr_hampel = np.where(np.isnan(hr_raw), np.nan, hr_hampel)
 
-        # Store smoothed HR back into df_sorted so it can be plotted
+            # Step 2: Rolling-median smooth (≈ 5 s window) to remove jitter
+            smooth_win = _odd(round(fs0 * 5.0))
+            hr_smoothed = np.clip(rolling_median_minp1(hr_hampel, smooth_win), 20.0, 250.0)
+
+            hr_for_win = prepare_hr_for_window(hr_smoothed.copy(), roll_win=1000)
+            hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
+            win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=2.0, min_samples=3)
+
+            cache_out["hr_block"] = {
+                "hr_smoothed": hr_smoothed.astype('float32'),
+                "win_half": win_half,
+                "uses_estimate": hr_used_est,
+            }
+
+# Store smoothed HR back into df_sorted so it can be plotted
         if "5: HR" in df_sorted.columns:
             df_sorted["5: HR"] = hr_smoothed.astype('float32')
 
-        hr = hr_smoothed
-        hr_for_win = prepare_hr_for_window(hr.copy(), roll_win=1000)
-        hr_for_win = np.where(np.isfinite(hr_for_win), hr_for_win, 60.0)
-        win_half = compute_win_half_from_hr(hr_for_win, fs0, factor=2.0, min_samples=3)
-        
         block_ids = df_sorted["segment_id"].values
         unique_blocks = np.unique(block_ids)
+        
+        # Hoist per-signal value arrays out of the per-beat loop. Signals are
+        # already float32 here; nanmean accumulates in float64 → identical results
+        # to the old per-beat pd.to_numeric(...).astype('float64') re-extraction.
+        sig_vals = {name: df_sorted[name].values for name in all_signals}
+        if fallback_signal and fallback_signal in all_signals:
+            fb_series = df_sorted[fallback_signal]
+            if not pd.api.types.is_numeric_dtype(fb_series):
+                fb_series = pd.to_numeric(fb_series, errors='coerce')
+            sig_cbf_full = fb_series.astype('float64').values
+        else:
+            sig_cbf_full = None
         
         beat_rows = []
         
@@ -249,7 +301,7 @@ def process_session_data(df_raw, df_channel_info, df_comments, settings, preview
                 
             p_cbf_b = np.array([], dtype=int)
             if fallback_signal and fallback_signal in all_signals:
-                sig_cbf_b = pd.to_numeric(df_sorted[fallback_signal].values[b_mask], errors='coerce').astype('float64')
+                sig_cbf_b = sig_cbf_full[b_mask]
                 p_cbf_b = find_local_high_indices(sig_cbf_b, win_half_b, fs=fs_cbf)
                 if len(p_cbf_b) > 0:
                     peaks_cbf = np.concatenate([peaks_cbf, p_cbf_b + b_offset])
@@ -283,17 +335,17 @@ def process_session_data(df_raw, df_channel_info, df_comments, settings, preview
                 c_val = df_sorted['comment'].values[center_idx + b_offset]
                 row['comment'] = c_val if isinstance(c_val, str) and c_val.strip() else ""
                 
+                base = b_offset
                 for sig_name in all_signals:
-                    y_b = pd.to_numeric(df_sorted[sig_name].values[b_mask], errors='coerce').astype('float64')
-                    
+                    full = sig_vals[sig_name]
                     if sig_name == fallback_signal and p_cbf_b.size > 0:
                         idx_cbf_start = np.argmin(np.abs(p_cbf_b - i0))
                         idx_cbf_end = np.argmin(np.abs(p_cbf_b - i1))
                         cbf_i0 = p_cbf_b[min(idx_cbf_start, idx_cbf_end)]
                         cbf_i1 = p_cbf_b[max(idx_cbf_start, idx_cbf_end)]
-                        seg_vals = y_b[cbf_i0 : cbf_i1 + 1]
+                        seg_vals = full[base + cbf_i0 : base + cbf_i1 + 1]
                     else:
-                        seg_vals = y_b[i0 : i1 + 1]
+                        seg_vals = full[base + i0 : base + i1 + 1]
                         
                     mval = np.nan if np.isnan(seg_vals).all() else float(np.nanmean(seg_vals))
                     row[sig_name] = mval

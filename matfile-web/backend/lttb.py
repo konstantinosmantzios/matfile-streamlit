@@ -18,16 +18,34 @@ def lttb_core(xv, yv, target_points):
     out_idx[-1] = n_valid - 1
 
     bucket_size = (n_valid - 2) / (target_points - 2)
+
+    # Bucket boundaries B[k] = min(floor(1 + k*bucket_size), n_valid).
+    # Bucket used for point i is [B[i-1], B[i]); the "next bucket" used
+    # for the triangle area is [B[i], B[i+1]).
+    B = np.minimum(
+        (1 + np.arange(target_points, dtype=np.float64) * bucket_size).astype(np.intp),
+        n_valid,
+    )
+
+    # Prefix sums let us compute every bucket mean in O(1) instead of
+    # slicing + np.mean() on each iteration.
+    psx = np.concatenate(([0.0], np.cumsum(xv)))
+    psy = np.concatenate(([0.0], np.cumsum(yv)))
+
     prev = 0
-
     for i in range(1, target_points - 1):
-        b_start = int(np.floor(1 + (i - 1) * bucket_size))
-        b_end   = min(int(np.floor(1 + i * bucket_size)), n_valid)
+        b_start = int(B[i - 1])
+        b_end = int(B[i])
+        nb_start = int(B[i])
+        nb_end = int(B[i + 1])
 
-        nb_start = int(np.floor(1 + i * bucket_size))
-        nb_end   = min(int(np.floor(1 + (i + 1) * bucket_size)), n_valid)
-        avg_x = np.mean(xv[nb_start:nb_end]) if nb_start < nb_end else xv[-1]
-        avg_y = np.mean(yv[nb_start:nb_end]) if nb_start < nb_end else yv[-1]
+        cnt = nb_end - nb_start
+        if cnt > 0:
+            avg_x = (psx[nb_end] - psx[nb_start]) / cnt
+            avg_y = (psy[nb_end] - psy[nb_start]) / cnt
+        else:
+            avg_x = xv[-1]
+            avg_y = yv[-1]
 
         bx = xv[b_start:b_end]
         by = yv[b_start:b_end]
@@ -54,40 +72,51 @@ def lttb_downsample(x, y, target_points):
 
     valid = np.isfinite(y)
     total_valid = int(valid.sum())
-    
+
     if total_valid <= target_points:
         return x.copy(), y.copy()
 
-    valid_diff = np.diff(valid.astype(int))
-    starts = np.where(valid_diff == 1)[0] + 1
-    if valid[0]:
-        starts = np.insert(starts, 0, 0)
-        
-    ends = np.where(valid_diff == -1)[0]
-    if valid[-1]:
-        ends = np.append(ends, n - 1)
+    x = np.asarray(x, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
 
-    out_x = []
-    out_y = []
-    
-    for s, e in zip(starts, ends):
+    valid_diff = np.diff(valid.astype(np.int8))
+    starts = np.flatnonzero(valid_diff == 1) + 1
+    if valid[0]:
+        starts = np.concatenate(([0], starts))
+
+    ends = np.flatnonzero(valid_diff == -1)
+    if valid[-1]:
+        ends = np.concatenate((ends, [n - 1]))
+
+    # First pass: compute per-block targets and total output length so we
+    # can preallocate instead of building Python lists.
+    blocks = list(zip(starts, ends))
+    n_blocks = len(blocks)
+    targets = [0] * n_blocks
+    out_len = 0
+    for i, (s, e) in enumerate(blocks):
         block_len = e - s + 1
         block_target = max(3, int(round(target_points * (block_len / total_valid))))
-        
-        bx, by = lttb_core(
-            x[s:e+1].astype(np.float64), 
-            y[s:e+1].astype(np.float64), 
-            block_target
-        )
-        out_x.append(bx)
-        out_y.append(by)
-        
-        # Insert a NaN after the block to preserve the gap
+        if block_target > block_len:
+            block_target = block_len
+        targets[i] = block_target
+        out_len += block_target
         if e < n - 1:
-            out_x.append([x[e+1]])
-            out_y.append([np.nan])
-            
-    if not out_x:
-        return x.copy(), y.copy()
-        
-    return np.concatenate(out_x), np.concatenate(out_y)
+            out_len += 1  # NaN separator preserves the gap
+
+    out_x = np.empty(out_len, dtype=np.float64)
+    out_y = np.empty(out_len, dtype=np.float64)
+
+    pos = 0
+    for (s, e), block_target in zip(blocks, targets):
+        bx, by = lttb_core(x[s:e + 1], y[s:e + 1], block_target)
+        nb = len(bx)
+        out_x[pos:pos + nb] = bx
+        out_y[pos:pos + nb] = by
+        pos += nb
+        if e < n - 1:
+            out_x[pos] = x[e + 1]
+            out_y[pos] = np.nan
+            pos += 1
+
+    return out_x[:pos], out_y[:pos]

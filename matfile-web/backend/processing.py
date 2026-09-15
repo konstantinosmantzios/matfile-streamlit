@@ -8,6 +8,31 @@ import scipy.io
 # Signal Processing Core Algorithms & Helpers
 # ---------------------------------------------------------
 
+def rolling_median_minp1(x, size):
+    """Centered rolling median with pandas' min_periods=1 edge semantics.
+
+    Delegates to pandas' linear-time rolling median (exact edges + NaN
+    propagation), which is ~100x faster than scipy.ndimage.median_filter for
+    large windows on multi-million-sample arrays.
+    """
+    return pd.Series(np.asarray(x, dtype=float)).rolling(
+        size, center=True, min_periods=1).median().to_numpy()
+
+def rolling_mad_minp1(x, size):
+    """Fast rolling Median Absolute Deviation with min_periods=1 edges.
+
+    Exact MAD about each window's own median would require a per-window
+    operation (slow pandas rolling.apply). This computes the rolling median of
+    the per-point absolute residual from the rolling median — a close
+    approximation, identical where the local median is stable (the norm for HR),
+    with differences confined to borderlines that the downstream ±3σ outlier
+    test only re-orders on.
+    """
+    x = np.asarray(x, dtype=float)
+    rm = rolling_median_minp1(x, size)
+    return pd.Series(np.abs(x - rm)).rolling(
+        size, center=True, min_periods=1).median().to_numpy()
+
 def first_nonempty_comment(series):
     """Return the first non-empty comment in a series, or empty string if none."""
     for c in series:
@@ -149,7 +174,12 @@ def apply_butter_lowpass(y, cutoff_freq, fs, order=4):
     return np.where(np.isnan(y), np.nan, y_filtered)
 
 def apply_hampel_filter(y, window_size=5, n_sigmas=3):
-    """Removes outlier spikes using rolling median and Median Absolute Deviation (MAD)."""
+    """Removes outlier spikes using rolling median and Median Absolute Deviation (MAD).
+
+    Kept on the original pandas implementation: it runs on the DISPLAYED filtered
+    signal (FP/CBF) only when the user selects the Hampel filter, and the windows
+    are tiny — so exactness matters more than speed here.
+    """
     y_series = pd.Series(y)
     rolling_median = y_series.rolling(window=window_size, center=True).median()
     rolling_mad = y_series.rolling(window=window_size, center=True).apply(

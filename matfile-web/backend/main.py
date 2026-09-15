@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 import io
 import scipy.io
 import pandas as pd
@@ -58,6 +59,13 @@ def get_memory_mb():
 def print_memory(tag=""):
     print(f"[MEMORY] {tag}: {get_memory_mb():.2f} MB")
 
+def print_timing(tag, since):
+    """Print elapsed wall-clock ms since `since` (from time.time())."""
+    print(f"[TIMING] {tag}: {(time.time() - since) * 1000:.1f} ms")
+
+def _timing_mark():
+    return time.time()
+
 def _settings_hash(settings: dict) -> str:
     """Hash of processing-relevant settings for cache invalidation."""
     relevant_keys = [
@@ -74,8 +82,13 @@ def _settings_hash(settings: dict) -> str:
 
 def _nan_safe_list(arr, decimals=2):
     """Numpy array → JSON-safe Python list (NaN → None)."""
-    rounded = np.round(arr, decimals)
-    return [None if np.isnan(v) else float(v) for v in rounded]
+    rounded = np.round(np.asarray(arr, dtype=np.float64), decimals)
+    lst = rounded.tolist()  # C-speed conversion
+    nan_idx = np.flatnonzero(np.isnan(rounded))
+    if nan_idx.size:
+        for i in nan_idx:
+            lst[int(i)] = None
+    return lst
 
 def to_unix_ms_local(series: pd.Series) -> np.ndarray:
     import tzlocal
@@ -90,6 +103,126 @@ def single_to_unix_ms_local(val):
     if pd.isna(val):
         return None
     return int(to_unix_ms_local(pd.to_datetime(pd.Series([val])))[0])
+
+def _build_signal_filtering_traces(sig, raw_df, df_sorted, result_df, raw_t, raw_t_f64,
+                                   target_pts, peaks, peaks_cbf, settings, resampled_t_ms):
+    """Filtering-preview Plotly traces for one signal.
+
+    Built from the raw (unfiltered) and processed frames so the output is
+    stable across signal switches. Results are cached per settings-hash and
+    reused on pure signal changes so no lttb/JSON work happens per switch.
+    """
+    traces = []
+    if sig not in df_sorted.columns:
+        return traces
+    is_hr = "HR" in sig
+    filt_y = pd.to_numeric(df_sorted[sig], errors="coerce").astype("float64").values
+    if raw_df is not None and sig in raw_df.columns:
+        raw_y = pd.to_numeric(raw_df[sig], errors="coerce").astype("float64").values
+    else:
+        raw_y = filt_y
+
+    if is_hr:
+        # HR: only the smoothed signal is meaningful (not beat-resampled)
+        hr_t_ds, hr_y_ds = lttb_downsample(raw_t_f64, filt_y, target_pts)
+        hr_t_ds, hr_y_ds = insert_gaps(hr_t_ds, hr_y_ds)
+        traces.append({
+            "trace_id": "filtered",
+            "x": _nan_safe_list(hr_t_ds, 0),
+            "y": _nan_safe_list(hr_y_ds),
+            "type": "scattergl", "mode": "lines",
+            "name": "HR (smoothed)",
+            "line": {"color": "#f97316", "width": 2},
+            "connectgaps": False,
+        })
+        return traces
+
+    raw_t_ds, raw_y_ds = lttb_downsample(raw_t_f64, raw_y, target_pts)
+    filt_t_ds, filt_y_ds = lttb_downsample(raw_t_f64, filt_y, target_pts)
+    raw_t_ds, raw_y_ds = insert_gaps(raw_t_ds, raw_y_ds)
+    filt_t_ds, filt_y_ds = insert_gaps(filt_t_ds, filt_y_ds)
+
+    traces.append({
+        "trace_id": "raw",
+        "x": _nan_safe_list(raw_t_ds, 0),
+        "y": _nan_safe_list(raw_y_ds),
+        "type": "scattergl", "mode": "lines",
+        "name": "Raw Data",
+        "line": {"color": "rgba(156,163,175,0.4)", "width": 1},
+        "connectgaps": False,
+    })
+    traces.append({
+        "trace_id": "filtered",
+        "x": _nan_safe_list(filt_t_ds, 0),
+        "y": _nan_safe_list(filt_y_ds),
+        "type": "scattergl", "mode": "lines",
+        "name": "Filtered Data",
+        "line": {"color": "#38bdf8", "width": 1},
+        "connectgaps": False,
+    })
+
+    # Beat-resampled data (only when the signal has a resampled column)
+    if not result_df.empty and sig in result_df.columns:
+        res_y = result_df[sig].values.astype("float64")
+        res_t, res_y = insert_gaps(resampled_t_ms.astype(np.float64), res_y)
+        traces.append({
+            "trace_id": "resampled",
+            "x": _nan_safe_list(res_t, 0),
+            "y": _nan_safe_list(res_y),
+            "type": "scattergl",
+            "mode": "lines+markers" if settings.get("resampleMode") == "Beat-based" else "lines",
+            "name": "Resampled Data",
+            "line": {"color": "#f97316", "width": 2},
+            "marker": {"size": 4} if settings.get("resampleMode") == "Beat-based" else None,
+            "connectgaps": False,
+        })
+
+    active_peaks = np.array([], dtype=int)
+    if "Finger Pressure" in sig:
+        active_peaks = peaks
+    elif "CBF" in sig:
+        active_peaks = peaks_cbf
+
+    if settings.get("resampleMode") == "Beat-based" and active_peaks.size > 0:
+        p_t = raw_t[active_peaks]
+        p_y = filt_y[active_peaks]
+        if len(p_t) > 3000:
+            step = len(p_t) // 3000
+            p_t = p_t[::step]
+            p_y = p_y[::step]
+        traces.append({
+            "trace_id": "peaks",
+            "x": _nan_safe_list(p_t, 0),
+            "y": _nan_safe_list(p_y),
+            "type": "scattergl", "mode": "markers",
+            "name": "Detected Beats",
+            "marker": {"color": "red", "size": 4},
+        })
+
+    if "Finger Pressure" in sig:
+        if raw_df is not None and "2: MAP" in raw_df.columns:
+            raw_map = pd.to_numeric(raw_df["2: MAP"], errors="coerce").astype("float64").values
+        else:
+            raw_map = raw_y
+        import scipy.ndimage
+        valid_mask = ~np.isnan(raw_map)
+        if valid_mask.any():
+            filled_y = np.where(valid_mask, raw_map, np.nanmean(raw_map))
+            gauss_y = scipy.ndimage.gaussian_filter1d(filled_y, sigma=1000/6)
+            gauss_y = np.where(valid_mask, gauss_y, np.nan)
+            g_t, g_y = lttb_downsample(raw_t_f64[valid_mask], gauss_y[valid_mask], target_pts)
+            g_t, g_y = insert_gaps(g_t, g_y)
+            traces.append({
+                "trace_id": "gauss1000",
+                "x": _nan_safe_list(g_t, 0),
+                "y": _nan_safe_list(g_y),
+                "type": "scattergl", "mode": "lines",
+                "name": "MAP - Gaussian 1000",
+                "line": {"color": "#a855f7", "width": 2},
+                "connectgaps": False,
+            })
+
+    return traces
 
 def insert_gaps(t, y, gap_ms=5000.0):
     if len(t) < 2: return t, y
@@ -170,6 +303,8 @@ async def lifespan(app):
     cleanup_all_temp_files()
 
 app = FastAPI(lifespan=lifespan)
+# Compress JSON responses (plot traces are large) — huge win on slow networks
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -498,6 +633,8 @@ async def process_data(payload: dict):
 
     try:
         print_memory("Process Start")
+        mark = mark0 = _timing_mark()
+        path_label = "unknown"
 
         s_hash = _settings_hash(settings)
         plot_cache = sd.get("plot_cache", {})
@@ -524,7 +661,9 @@ async def process_data(payload: dict):
                 
             x_arr = df_read["time_s"].values if "time_s" in df_read.columns else np.array([])
             y_arr = df_read.get(main_signal, pd.Series(dtype=float)).values
-            resampled_t_dt = pd.to_datetime(df_read["absolute_time"]).values if "absolute_time" in df_read.columns else np.array([])
+            resampled_t_dt = sd.get("resampled_t_dt")
+            if resampled_t_dt is None or len(resampled_t_dt) != len(df_read):
+                resampled_t_dt = pd.to_datetime(df_read["absolute_time"]).values if "absolute_time" in df_read.columns else np.array([])
             
             use_map_for_stats = settings.get("useMapGaussianForStats", False)
             if use_map_for_stats and "Finger Pressure" in main_signal and "gauss_MAP" in df_read.columns:
@@ -537,11 +676,27 @@ async def process_data(payload: dict):
             base_trace = next((t for t in last_res["analysis_traces"] if t.get("trace_id") == "resampled"), None)
             new_analysis_traces = [base_trace] if base_trace else []
             
+            viz_mark = _timing_mark()
             end_overrides = payload.get("end_marker_overrides", {})
-            vt, vs, va, vst = generate_analysis_viz(
-                main_signal, x_arr, y_arr, resampled_t_dt,
-                comment_list, b_win, e_win, use_b_area, baseline_end_comment, end_overrides
+            viz_key = (
+                main_signal, b_win, e_win, use_b_area, baseline_end_comment,
+                json.dumps(end_overrides, sort_keys=True, default=str),
+                repr([(c.get("time_s"), c.get("comment_text"),
+                       str(c.get("absolute_time"))) for c in comment_list]),
             )
+            viz_cache = sd.setdefault("viz_cache", {})
+            cached_viz = viz_cache.get(viz_key)
+            if cached_viz is None:
+                vt, vs, va, vst = generate_analysis_viz(
+                    main_signal, x_arr, y_arr, resampled_t_dt,
+                    comment_list, b_win, e_win, use_b_area, baseline_end_comment, end_overrides
+                )
+                viz_cache[viz_key] = (vt, vs, va, vst)
+                if len(viz_cache) > 64:
+                    viz_cache.clear()
+            else:
+                vt, vs, va, vst = cached_viz
+            print_timing("[process] FULL cache hit: analysis viz (cached=hit/miss)", viz_mark)
             new_analysis_traces.extend(vt)
             
             dbg_traces = [t for t in last_res["analysis_traces"] if str(t.get("trace_id", "")).startswith("gauss")]
@@ -557,24 +712,30 @@ async def process_data(payload: dict):
             
             plot_cache["analysis_view"] = settings.get("analysisView", "Filtering Preview")
             
+            print_timing("[process] FULL cache hit (identical request served from RAM)", mark)
             print_memory("Cache Hit: Process Complete")
             return last_res
 
         is_partial_cache_hit = (last_res and plot_cache.get("settings_hash") == s_hash and plot_cache.get("selected_signal") != main_signal)
 
-        # ---- read raw data from parquet (with optional time filter) -----
-        pq_filters = None
-        if start_s is not None and end_s is not None:
-            pq_filters = [("time_s", ">=", float(start_s)),
-                          ("time_s", "<=", float(end_s))]
-                          
+        # ---- resolve raw data (reuse in-memory cache when the time range is unchanged) ----
+        range_key = (start_s, end_s)
+        cached_raw = sd.get("cached_raw_df")
+        cached_raw_range = sd.get("cached_raw_range")
+        use_cached_raw = (cached_raw is not None and cached_raw_range == range_key)
+
         # We need all_signals to fallback main_signal if it's empty
         import pyarrow.parquet as pq
-        schema = pq.read_schema(raw_pq)
-        all_signals = [
-            c for c in schema.names 
-            if ":" in c and not any(x in c for x in ["MAP", "Systolic", "Diastolic"])
-        ]
+        if use_cached_raw and sd.get("available_signals"):
+            all_signals = sd["available_signals"]
+        else:
+            schema = pq.read_schema(raw_pq)
+            all_signals = [
+                c for c in schema.names 
+                if ":" in c and not any(x in c for x in ["MAP", "Systolic", "Diastolic"])
+            ]
+            sd["available_signals"] = all_signals
+
         if not main_signal or main_signal not in all_signals:
             main_signal = next(
                 (s for s in all_signals
@@ -582,19 +743,39 @@ async def process_data(payload: dict):
                 all_signals[0] if all_signals else "",
             )
 
+        if is_partial_cache_hit:
+            path_label = "partial (signal switch)"
+        elif use_cached_raw:
+            path_label = "raw-cache (filter tweak)"
+        else:
+            path_label = "full (parquet read + process)"
+
         if is_partial_cache_hit and "cached_df_sorted" in sd:
             df_raw = pd.DataFrame()
             df_raw_sorted = sd["cached_df_sorted"]
+            # source the "raw" column from the true raw frame (processed values
+            # live in df_sorted and would otherwise show filtered data as raw)
+            raw_df_now = sd.get("cached_raw_df")
+            raw_col = raw_df_now if (raw_df_now is not None and main_signal in raw_df_now.columns) else df_raw_sorted
+            raw_y_display = pd.to_numeric(raw_col[main_signal], errors="coerce").astype("float64").values.copy()
+            raw_map_display = None
+            if "2: MAP" in raw_col.columns:
+                raw_map_display = pd.to_numeric(raw_col["2: MAP"], errors="coerce").astype("float64").values.copy()
+        elif use_cached_raw:
+            print_memory("Raw cache hit: skipping parquet read")
+            df_raw = cached_raw
+            df_raw_sorted = cached_raw
             raw_y_display = pd.to_numeric(df_raw_sorted[main_signal], errors="coerce").astype("float64").values.copy()
             raw_map_display = None
             if "2: MAP" in df_raw_sorted.columns:
                 raw_map_display = pd.to_numeric(df_raw_sorted["2: MAP"], errors="coerce").astype("float64").values.copy()
         else:
-            try:
-                df_raw = pd.read_parquet(raw_pq, engine="pyarrow", filters=pq_filters)
-            except Exception:
-                df_raw = pd.read_parquet(raw_pq, engine="pyarrow", filters=pq_filters)
-                
+            pq_filters = None
+            if start_s is not None and end_s is not None:
+                pq_filters = [("time_s", ">=", float(start_s)),
+                              ("time_s", "<=", float(end_s))]
+
+            df_raw = pd.read_parquet(raw_pq, engine="pyarrow", filters=pq_filters)
             print_memory("After parquet read")
             df_raw_sorted = df_raw.sort_values("time_s")
             raw_y_display = pd.to_numeric(
@@ -605,6 +786,14 @@ async def process_data(payload: dict):
                 raw_map_display = pd.to_numeric(
                     df_raw_sorted["2: MAP"], errors="coerce"
                 ).astype("float64").values.copy()
+            # cache time array up front so later filter tweaks skip datetime math
+            sd["cached_raw_t_ms"] = np.asarray(
+                to_unix_ms_local(df_raw_sorted["absolute_time"]), dtype=np.int64
+            )
+            sd["cached_raw_n"] = int(len(df_raw_sorted))
+
+        print_timing(f"[process] raw resolve ({path_label})", mark)
+        mark = _timing_mark()
 
         # ---- process (filter / beat-detect / resample) ----------------
         if is_partial_cache_hit and "cached_df_sorted" in sd:
@@ -616,102 +805,165 @@ async def process_data(payload: dict):
             peaks_cbf = sd.get("cached_peaks_cbf", np.array([], dtype=int))
             agg5_moving_map = sd.get("cached_agg5_moving_map", {})
         else:
+            cache_in = {}
+            if use_cached_raw:
+                cache_in = {"segment_id": sd.get("cached_segment_id"),
+                            "hr_block": sd.get("cached_hr_block")}
+            cache_out = {}
             df_sorted, result_df, peaks, peaks_cbf, agg5_moving_map = \
-                process_session_data(df_raw, df_channel_info, df_comments, settings)
+                process_session_data(df_raw, df_channel_info, df_comments, settings,
+                                     cache_in=cache_in, cache_out=cache_out)
+            if "segment_id" in cache_out:
+                sd["cached_segment_id"] = cache_out["segment_id"]
+            # only retain a usable HR cache (skip when HR estimation was needed,
+            # since that depends on the filtered main signal)
+            hr_block = cache_out.get("hr_block")
+            if hr_block is not None and not hr_block.get("uses_estimate"):
+                sd["cached_hr_block"] = hr_block
                 
             # Save for partial cache hits
             sd["cached_peaks"] = peaks
             sd["cached_peaks_cbf"] = peaks_cbf
             sd["cached_agg5_moving_map"] = agg5_moving_map
             
-            # PRE-COMPUTE Gaussian MAP for analysis stats
+            # PRE-COMPUTE Gaussian MAP for analysis stats. Raw-level smoothing is
+            # filter-independent → reuse it across filter tweaks via interpolation.
             import scipy.ndimage
-            raw_map = df_sorted.get("2: MAP", pd.Series(dtype=float)).values
-            if len(raw_map) == 0 and main_signal in df_sorted.columns:
-                raw_map = df_sorted[main_signal].values
-            
-            valid_mask = ~np.isnan(raw_map)
-            if valid_mask.any() and not result_df.empty:
-                filled_map = np.where(valid_mask, raw_map, np.nanmean(raw_map))
-                gauss_map_200hz = scipy.ndimage.gaussian_filter1d(filled_map, sigma=1000/6)
-                valid_points = np.isfinite(gauss_map_200hz)
-                res_t_s = result_df["time_s"].values
-                raw_t_s = df_sorted["time_s"].values
-                result_df["gauss_MAP"] = np.interp(res_t_s, raw_t_s[valid_points], gauss_map_200hz[valid_points])
+            gauss_cache = sd.get("gauss_map_cache")
+            if (gauss_cache is not None and use_cached_raw
+                    and not result_df.empty and "raw_t_s" in gauss_cache):
+                result_df["gauss_MAP"] = np.interp(
+                    result_df["time_s"].values,
+                    gauss_cache["raw_t_s"][gauss_cache["valid"]],
+                    gauss_cache["smoothed"][gauss_cache["valid"]],
+                )
+            else:
+                raw_map = df_sorted.get("2: MAP", pd.Series(dtype=float)).values
+                if len(raw_map) == 0 and main_signal in df_sorted.columns:
+                    raw_map = df_sorted[main_signal].values
+
+                valid_mask = ~np.isnan(raw_map)
+                if valid_mask.any() and not result_df.empty:
+                    filled_map = np.where(valid_mask, raw_map, np.nanmean(raw_map))
+                    gauss_map_200hz = scipy.ndimage.gaussian_filter1d(filled_map, sigma=1000/6)
+                    valid_points = np.isfinite(gauss_map_200hz)
+                    res_t_s = result_df["time_s"].values
+                    raw_t_s = df_sorted["time_s"].values
+                    result_df["gauss_MAP"] = np.interp(res_t_s, raw_t_s[valid_points], gauss_map_200hz[valid_points])
+                    sd["gauss_map_cache"] = {
+                        "smoothed": gauss_map_200hz.astype(np.float32),
+                        "raw_t_s": raw_t_s,
+                        "valid": valid_points,
+                    }
 
             sd["cached_df_sorted"] = df_sorted
             sd["cached_result_df"] = result_df
 
-        del df_raw, df_raw_sorted
+            # Cache the raw (sorted, numeric) frame so the NEXT filter tweak
+            # skips the parquet read + sort + dtype conversion entirely.
+            if not use_cached_raw:
+                sd["cached_raw_df"] = df_raw_sorted
+                sd["cached_raw_range"] = range_key
+
+        del df_raw
+        if not use_cached_raw:
+            del df_raw_sorted
         gc.collect()
+        print_timing("[process] filter/beat/resample (skip=partial)", mark)
+        mark = _timing_mark()
         print_memory("After processing")
 
-        # ---- save processed data for viewport -------------------------
-        proc_pq = os.path.join(TEMP_DIR, f"{session_id}_processed.parquet")
-        df_sorted.to_parquet(proc_pq, engine="pyarrow", index=False,
-                             row_group_size=50_000)
-        sd["processed_parquet_path"] = proc_pq
-        
-        if not result_df.empty:
-            res_pq = os.path.join(TEMP_DIR, f"{session_id}_resampled.parquet")
-            result_df.to_parquet(res_pq, engine="pyarrow", index=False)
-            sd["resampled_parquet_path"] = res_pq
-        elif "resampled_parquet_path" in sd:
-            del sd["resampled_parquet_path"]
+        # ---- save processed data for viewport fallback (only when range changes) ----
+        if sd.get("proc_pq_range") != range_key:
+            proc_pq = os.path.join(TEMP_DIR, f"{session_id}_processed.parquet")
+            df_sorted.to_parquet(proc_pq, engine="pyarrow", index=False,
+                                 row_group_size=50_000)
+            sd["processed_parquet_path"] = proc_pq
+            
+            if not result_df.empty:
+                res_pq = os.path.join(TEMP_DIR, f"{session_id}_resampled.parquet")
+                result_df.to_parquet(res_pq, engine="pyarrow", index=False)
+                sd["resampled_parquet_path"] = res_pq
+            elif "resampled_parquet_path" in sd:
+                del sd["resampled_parquet_path"]
+            sd["proc_pq_range"] = range_key
 
         # ---- timestamps & filtered values ----------------------------
-        raw_t = to_unix_ms_local(df_sorted["absolute_time"])
+        cached_t = sd.get("cached_raw_t_ms")
+        if cached_t is not None and len(cached_t) == len(df_sorted):
+            raw_t = cached_t
+        else:
+            raw_t = to_unix_ms_local(df_sorted["absolute_time"])
+            sd["cached_raw_t_ms"] = np.asarray(raw_t, dtype=np.int64)
+            sd["cached_raw_n"] = int(len(df_sorted))
         filt_y = pd.to_numeric(
             df_sorted[main_signal], errors="coerce"
         ).astype("float64").values
 
-        # ---- LTTB downsample for initial view -------------------------
+        # ---- cache raw/filtered arrays in RAM for instant /api/viewport ----
+        # df_sorted is already kept in memory (cached_df_sorted), so these are
+        # near-free references that let pan/zoom bypass parquet I/O entirely.
+        sd["viewport_raw_t"] = np.asarray(raw_t, dtype=np.int64)
+        sd["viewport_raw_y"] = np.asarray(raw_y_display, dtype=np.float32)
+        sd["viewport_filt_y"] = np.asarray(filt_y, dtype=np.float32)
+        sd["viewport_map_y"] = (
+            np.asarray(raw_map_display, dtype=np.float32)
+            if raw_map_display is not None else None
+        )
+
+        # ---- resampled timestamps (cached across requests) -----------
         raw_t_f64 = raw_t.astype(np.float64)
-        raw_t_ds, raw_y_ds = lttb_downsample(raw_t_f64, raw_y_display, target_pts)
-        filt_t_ds, filt_y_ds = lttb_downsample(raw_t_f64, filt_y, target_pts)
-
-        dbg_traces = []
-        if "Finger Pressure" in main_signal:
-            raw_y_copy = raw_map_display if raw_map_display is not None else raw_y_display
-            
-            # Use scipy's gaussian_filter1d for massive speedup over pandas rolling
-            import scipy.ndimage
-            valid_mask = ~np.isnan(raw_y_copy)
-            if valid_mask.any():
-                # Fill NaNs with mean to prevent NaN propagation in scipy filter
-                filled_y = np.where(valid_mask, raw_y_copy, np.nanmean(raw_y_copy))
-                gauss_y = scipy.ndimage.gaussian_filter1d(filled_y, sigma=1000/6)
-                # Restore NaNs
-                gauss_y = np.where(valid_mask, gauss_y, np.nan)
-            if valid_mask.any():
-                g_t = raw_t_f64[valid_mask]
-                g_y = gauss_y[valid_mask]
-                g_t_ds, g_y_ds = lttb_downsample(g_t, g_y, target_pts)
-                g_t_ds, g_y_ds = insert_gaps(g_t_ds, g_y_ds)
-                
-                dbg_traces.append({
-                    "trace_id": "gauss1000",
-                    "x": _nan_safe_list(g_t_ds, 0),
-                    "y": _nan_safe_list(g_y_ds),
-                    "type": "scattergl", "mode": "lines",
-                    "name": "MAP - Gaussian 1000",
-                    "line": {"color": "#a855f7", "width": 2},
-                    "connectgaps": False,
-                })
-
-        # ---- resampled data (already sparse → send in full) -----------
         if not result_df.empty:
-            res_t_raw = to_unix_ms_local(result_df["absolute_time"])
-            res_y = result_df[main_signal].values.astype("float64")
+            resampled_t_ms = sd.get("resampled_t_ms")
+            if resampled_t_ms is None or len(resampled_t_ms) != len(result_df):
+                resampled_t_ms = np.asarray(
+                    to_unix_ms_local(result_df["absolute_time"]), dtype=np.int64
+                )
+                sd["resampled_t_ms"] = resampled_t_ms
+            resampled_t_dt = sd.get("resampled_t_dt")
+            if resampled_t_dt is None or len(resampled_t_dt) != len(result_df):
+                resampled_t_dt = pd.to_datetime(result_df["absolute_time"]).values
+                sd["resampled_t_dt"] = resampled_t_dt
         else:
-            res_t_raw = raw_t
-            res_y = raw_y_display
+            resampled_t_ms = raw_t
+            resampled_t_dt = (
+                pd.to_datetime(df_sorted["absolute_time"]).values
+                if "absolute_time" in df_sorted else np.array([])
+            )
 
-        # (Do not downsample resampled data because analysis_viz markers are calculated on full res data)
+        # ---- per-signal filtering traces -------------------------------
+        # Built once per settings-hash across ALL signals, then reused on pure
+        # signal switches so a signal change needs no lttb/gap/JSON work.
+        stbs = sd.get("signal_traces_by_signal")
+        if not stbs or sd.get("stbs_ahash") != s_hash:
+            raw_df_src = sd.get("cached_raw_df", df_sorted)
+            stbs = {}
+            for sig in all_signals:
+                stbs[sig] = _build_signal_filtering_traces(
+                    sig, raw_df_src, df_sorted, result_df, raw_t, raw_t_f64,
+                    target_pts, peaks, peaks_cbf, settings, resampled_t_ms,
+                )
+            sd["signal_traces_by_signal"] = stbs
+            sd["stbs_ahash"] = s_hash
 
-        raw_t_ds, raw_y_ds = insert_gaps(raw_t_ds, raw_y_ds)
-        filt_t_ds, filt_y_ds = insert_gaps(filt_t_ds, filt_y_ds)
-        res_t, res_y = insert_gaps(res_t_raw.astype(np.float64), res_y)
+        # raw/filtered/resampled arrays for the current signal (analysis + viewport)
+        res_y_main = (
+            result_df[main_signal].values.astype("float64")
+            if (not result_df.empty and main_signal in result_df.columns)
+            else raw_y_display
+        )
+        # cache resampled arrays so /api/viewport doesn't re-read the parquet
+        sd["viewport_res_t"] = np.asarray(resampled_t_ms, dtype=np.int64)
+        sd["viewport_res_y"] = np.asarray(res_y_main, dtype=np.float32)
+
+        # (Do not downsample resampled data because analysis_viz markers are
+        #  calculated on full res data) — the per-signal traces above are the
+        #  downsampled raw/filtered views + full resampled view.
+
+        res_t, res_y = insert_gaps(resampled_t_ms.astype(np.float64), res_y_main)
+
+        print_timing("[process] resampled ts + stbs per-signal cache (rebuild=full)", mark)
+        mark = _timing_mark()
 
         # ---- build Plotly traces --------------------------------------
         filtering_traces = []
@@ -723,77 +975,16 @@ async def process_data(payload: dict):
         analysis_annotations = []
         stats = []
 
-        priority_signal = next((s for s in all_signals if s.startswith("1:") or "Finger Pressure" in s), all_signals[0] if all_signals else "")
-        fallback_signal = next((s for s in all_signals if s.startswith("6:") or "CBF" in s), None)
+        # --- 1. Filtering Preview Build (from per-signal cache) ---
         is_hr_signal = "HR" in main_signal
-
-        # --- 1. Filtering Preview Build ---
-        if is_hr_signal:
-            # For HR: only show the smoothed signal (stored in df_sorted after process_logic cleaned it).
-            # The raw and resampled traces are meaningless for HR (not beat-resampled).
-            hr_smoothed_y = pd.to_numeric(df_sorted[main_signal], errors="coerce").astype("float64").values
-            hr_t_ds, hr_y_ds = lttb_downsample(raw_t_f64, hr_smoothed_y, target_pts)
-            hr_t_ds, hr_y_ds = insert_gaps(hr_t_ds, hr_y_ds)
-            filtering_traces.append({
-                "trace_id": "filtered",
-                "x": _nan_safe_list(hr_t_ds, 0),
-                "y": _nan_safe_list(hr_y_ds),
-                "type": "scattergl", "mode": "lines",
-                "name": "HR (smoothed)",
-                "line": {"color": "#f97316", "width": 2},
-                "connectgaps": False,
-            })
-        else:
-            filtering_traces.append({
-                    "trace_id": "raw",
-                    "x": _nan_safe_list(raw_t_ds, 0),
-                    "y": _nan_safe_list(raw_y_ds),
-                    "type": "scattergl", "mode": "lines",
-                    "name": "Raw Data",
-                    "line": {"color": "rgba(156,163,175,0.4)", "width": 1},
-                    "connectgaps": False,
-                })
-            filtering_traces.append({
-                "trace_id": "filtered",
-                "x": _nan_safe_list(filt_t_ds, 0),
-                "y": _nan_safe_list(filt_y_ds),
-                "type": "scattergl", "mode": "lines",
-                "name": "Filtered Data",
-                "line": {"color": "#38bdf8", "width": 1},
-                "connectgaps": False,
-            })
-            filtering_traces.append({
-                    "trace_id": "resampled",
-                    "x": _nan_safe_list(res_t, 0),
-                    "y": _nan_safe_list(res_y),
-                    "type": "scattergl", "mode": "lines+markers" if settings.get("resampleMode") == "Beat-based" else "lines",
-                    "name": "Resampled Data",
-                    "line": {"color": "#f97316", "width": 2},
-                    "marker": {"size": 4} if settings.get("resampleMode") == "Beat-based" else None,
-                    "connectgaps": False,
-                })
-
-        active_peaks = np.array([], dtype=int)
-        if main_signal == priority_signal:
-            active_peaks = peaks
-        elif fallback_signal and main_signal == fallback_signal:
-            active_peaks = peaks_cbf
-
-        if not is_hr_signal and settings.get("resampleMode") == "Beat-based" and active_peaks.size > 0:
-            p_t = raw_t[active_peaks]
-            p_y = filt_y[active_peaks]
-            if len(p_t) > 3000:
-                step = len(p_t) // 3000
-                p_t = p_t[::step]
-                p_y = p_y[::step]
-            filtering_traces.append({
-                "trace_id": "peaks",
-                "x": _nan_safe_list(p_t, 0),
-                "y": _nan_safe_list(p_y),
-                "type": "scattergl", "mode": "markers",
-                "name": "Detected Beats",
-                "marker": {"color": "red", "size": 4},
-            })
+        filtering_traces = list(stbs.get(main_signal) or [])
+        if not filtering_traces:
+            raw_df_src = sd.get("cached_raw_df", df_sorted)
+            filtering_traces = _build_signal_filtering_traces(
+                main_signal, raw_df_src, df_sorted, result_df, raw_t, raw_t_f64,
+                target_pts, peaks, peaks_cbf, settings, resampled_t_ms,
+            )
+            stbs[main_signal] = filtering_traces
         
         if not df_comments.empty and "comment_text" in df_comments.columns:
             for _, row in df_comments[df_comments["comment_text"] != ""].iterrows():
@@ -841,11 +1032,14 @@ async def process_data(payload: dict):
                 
         # --- 2. Supine-to-Standing Analysis Build ---
         if is_hr_signal:
-            # Use the same smoothed HR trace (already built above)
+            # Only the smoothed HR trace is meaningful (not beat-resampled)
+            hr_sm = pd.to_numeric(df_sorted[main_signal], errors="coerce").astype("float64").values
+            hr_ds_t, hr_ds_y = lttb_downsample(raw_t_f64, hr_sm, target_pts)
+            hr_ds_t, hr_ds_y = insert_gaps(hr_ds_t, hr_ds_y)
             analysis_traces.append({
                 "trace_id": "filtered",
-                "x": _nan_safe_list(hr_t_ds, 0),
-                "y": _nan_safe_list(hr_y_ds),
+                "x": _nan_safe_list(hr_ds_t, 0),
+                "y": _nan_safe_list(hr_ds_y),
                 "type": "scattergl", "mode": "lines",
                 "name": "HR (smoothed)",
                 "line": {"color": "#f97316", "width": 2},
@@ -866,7 +1060,7 @@ async def process_data(payload: dict):
         use_map_for_stats = settings.get("useMapGaussianForStats", False)
         if not result_df.empty:
             x_arr = result_df["time_s"].values
-            resampled_t_dt = pd.to_datetime(result_df["absolute_time"]).values
+            # resampled_t_dt is cached alongside the resampled frame
             if use_map_for_stats and "Finger Pressure" in main_signal:
                 if "gauss_MAP" in result_df.columns:
                     y_arr = result_df["gauss_MAP"].values.astype("float64")
@@ -897,27 +1091,44 @@ async def process_data(payload: dict):
         use_b_area = settings.get("useBaselineArea", False)
         baseline_end_comment = settings.get("baselineEndComment", "Transition")
 
+        viz_mark = _timing_mark()
         try:
             end_overrides = payload.get("end_marker_overrides", {})
-            vt, vs, va, vst = generate_analysis_viz(
-                main_signal, x_arr, y_arr, resampled_t_dt,
-                comment_list, b_win, e_win, use_b_area, baseline_end_comment, end_overrides
+            viz_key = (
+                main_signal, b_win, e_win, use_b_area, baseline_end_comment,
+                json.dumps(end_overrides, sort_keys=True, default=str),
+                repr([(c.get("time_s"), c.get("comment_text"),
+                       str(c.get("absolute_time"))) for c in comment_list]),
             )
+            viz_cache = sd.setdefault("viz_cache", {})
+            cached_viz = viz_cache.get(viz_key)
+            if cached_viz is None:
+                cached_viz = generate_analysis_viz(
+                    main_signal, x_arr, y_arr, resampled_t_dt,
+                    comment_list, b_win, e_win, use_b_area, baseline_end_comment, end_overrides
+                )
+                viz_cache[viz_key] = cached_viz
+                if len(viz_cache) > 64:
+                    viz_cache.clear()
+            vt, vs, va, vst = cached_viz
             analysis_traces.extend(vt)
             analysis_shapes.extend(vs)
             analysis_annotations.extend(va)
             stats.extend(vst)
         except Exception as e:
             print(f"Error generating analysis viz: {e}")
+        print_timing("[process] build: analysis viz", viz_mark)
 
-        filtering_traces.extend(dbg_traces)
-        analysis_traces.extend(dbg_traces)
+        gauss_for_main = [t for t in filtering_traces if str(t.get("trace_id", "")).startswith("gauss")]
+        analysis_traces.extend(gauss_for_main)
         
         # Add comment vertical lines and text labels to Analysis tab as well
         analysis_shapes.extend(filtering_shapes)
         analysis_annotations.extend(filtering_annotations)
 
         # ---- cache for viewport re-fetch --------------------------------
+        print_timing(f"[process] traces + analysis build ({path_label})", mark)
+        mark = _timing_mark()
         s_hash = _settings_hash(settings)
         sd["plot_cache"] = {
             "settings_hash": s_hash,
@@ -929,6 +1140,7 @@ async def process_data(payload: dict):
         # ---- free heavy objects -----------------------------------------
         del df_sorted, result_df, agg5_moving_map, raw_t, raw_y_display, filt_y, raw_map_display
         gc.collect()
+        print_timing(f"[process] TOTAL {main_signal}  path={path_label}", mark0)
         print_memory("Process Complete")
 
         res = {
@@ -968,46 +1180,76 @@ async def viewport_data(payload: dict):
     target_pts = payload.get("target_points", TARGET_POINTS_DEFAULT)
     main_signal = cache["selected_signal"]
 
-    raw_pq = sd["raw_parquet_path"]
-    proc_pq = sd.get("processed_parquet_path")
-    if not proc_pq or not os.path.exists(proc_pq):
-        raise HTTPException(status_code=400, detail="Call /api/process first")
-
     try:
-        # convert ms → datetime64 for parquet predicate pushdown
-        import tzlocal
-        local_tz = tzlocal.get_localzone_name()
-        t_min = pd.Timestamp(x_min, unit="ms", tz="UTC").tz_convert(local_tz).tz_localize(None)
-        t_max = pd.Timestamp(x_max, unit="ms", tz="UTC").tz_convert(local_tz).tz_localize(None)
-        pq_filter = [("absolute_time", ">=", t_min),
-                      ("absolute_time", "<=", t_max)]
+        mark = mark0 = _timing_mark()
+        vp_path = "RAM"
+        # ---- FAST PATH: serve from in-memory arrays cached by /api/process ----
+        # (the processed DataFrame is already held in RAM, so pan/zoom avoids
+        #  all parquet I/O + datetime conversion + LTTB on the full dataset)
+        raw_t_mem = sd.get("viewport_raw_t")
+        raw_y_mem = sd.get("viewport_raw_y")
+        filt_y_mem = sd.get("viewport_filt_y")
 
-        import pyarrow.parquet as pq
-        existing_cols = pq.read_schema(raw_pq).names
-        
-        # read ONLY the needed columns for the visible range
-        cols = ["absolute_time", main_signal]
-        if "Finger Pressure" in main_signal:
-            if "2: MAP" in existing_cols:
-                cols.append("2: MAP")
-                    
-        df_raw_v = pd.read_parquet(raw_pq, columns=cols, engine="pyarrow",
-                                    filters=pq_filter)
-        df_filt_v = pd.read_parquet(proc_pq, columns=cols, engine="pyarrow",
-                                     filters=pq_filter)
+        if raw_t_mem is not None and raw_y_mem is not None and filt_y_mem is not None:
+            lo = int(np.searchsorted(raw_t_mem, x_min, side="left"))
+            hi = int(np.searchsorted(raw_t_mem, x_max, side="right"))
+            lo = max(0, lo)
+            hi = min(len(raw_t_mem), hi)
 
-        raw_t = to_unix_ms_local(df_raw_v["absolute_time"])
-        raw_y = pd.to_numeric(df_raw_v[main_signal], errors="coerce").astype("float64").values
-        filt_t = to_unix_ms_local(df_filt_v["absolute_time"])
-        filt_y = pd.to_numeric(df_filt_v[main_signal], errors="coerce").astype("float64").values
+            raw_t = raw_t_mem[lo:hi]                                # int64 ms
+            raw_y = raw_y_mem[lo:hi].astype(np.float64)
+            filt_t = raw_t                                         # same time base
+            filt_y = filt_y_mem[lo:hi].astype(np.float64)
 
-        raw_map_v = None
-        if "2: MAP" in df_raw_v.columns:
-            raw_map_v = pd.to_numeric(df_raw_v["2: MAP"], errors="coerce").astype("float64").values.copy()
+            raw_map_v = None
+            map_mem = sd.get("viewport_map_y")
+            if map_mem is not None:
+                raw_map_v = map_mem[lo:hi].astype(np.float64)
+        else:
+            vp_path = "parquet"
+            # ---- FALLBACK: read from parquet (only if caches are missing) ----
+            raw_pq = sd["raw_parquet_path"]
+            proc_pq = sd.get("processed_parquet_path")
+            if not proc_pq or not os.path.exists(proc_pq):
+                raise HTTPException(status_code=400, detail="Call /api/process first")
+
+            # convert ms → datetime64 for parquet predicate pushdown
+            import tzlocal
+            local_tz = tzlocal.get_localzone_name()
+            t_min = pd.Timestamp(x_min, unit="ms", tz="UTC").tz_convert(local_tz).tz_localize(None)
+            t_max = pd.Timestamp(x_max, unit="ms", tz="UTC").tz_convert(local_tz).tz_localize(None)
+            pq_filter = [("absolute_time", ">=", t_min),
+                          ("absolute_time", "<=", t_max)]
+
+            import pyarrow.parquet as pq
+            existing_cols = pq.read_schema(raw_pq).names
+
+            # read ONLY the needed columns for the visible range
+            cols = ["absolute_time", main_signal]
+            if "Finger Pressure" in main_signal:
+                if "2: MAP" in existing_cols:
+                    cols.append("2: MAP")
+
+            df_raw_v = pd.read_parquet(raw_pq, columns=cols, engine="pyarrow",
+                                        filters=pq_filter)
+            df_filt_v = pd.read_parquet(proc_pq, columns=cols, engine="pyarrow",
+                                         filters=pq_filter)
+
+            raw_t = to_unix_ms_local(df_raw_v["absolute_time"])
+            raw_y = pd.to_numeric(df_raw_v[main_signal], errors="coerce").astype("float64").values
+            filt_t = to_unix_ms_local(df_filt_v["absolute_time"])
+            filt_y = pd.to_numeric(df_filt_v[main_signal], errors="coerce").astype("float64").values
+
+            raw_map_v = None
+            if "2: MAP" in df_raw_v.columns:
+                raw_map_v = pd.to_numeric(df_raw_v["2: MAP"], errors="coerce").astype("float64").values.copy()
+
+            del df_raw_v, df_filt_v
 
         compare_gaussian = cache.get("compare_gaussian", False)
 
-        del df_raw_v, df_filt_v
+        print_timing(f"[viewport] raw slice resolve  path={vp_path}", mark)
+        mark = _timing_mark()
 
         n_pts = len(raw_y)
         if n_pts <= target_pts:
@@ -1073,19 +1315,27 @@ async def viewport_data(payload: dict):
                 }
             ])
         
-        res_pq = sd.get("resampled_parquet_path")
-        if res_pq and os.path.exists(res_pq):
-            df_res_v = pd.read_parquet(res_pq, columns=["absolute_time", main_signal], engine="pyarrow")
-            res_t = to_unix_ms_local(df_res_v["absolute_time"])
-            res_y = pd.to_numeric(df_res_v[main_signal], errors="coerce").astype("float64").values
-            
-            # Filter manually to visible range
-            mask = (res_t >= x_min) & (res_t <= x_max)
-            res_t = res_t[mask]
-            res_y = res_y[mask]
+        # ---- resampled trace (from cached RAM arrays when available) ------
+        res_t_mem = sd.get("viewport_res_t")
+        res_y_mem = sd.get("viewport_res_y")
+        if res_t_mem is not None and res_y_mem is not None:
+            mask = (res_t_mem >= x_min) & (res_t_mem <= x_max)
+            res_t = res_t_mem[mask].astype(np.float64)
+            res_y = res_y_mem[mask].astype(np.float64)
         else:
-            res_t = raw_t.copy()
-            res_y = raw_y.copy()
+            res_pq = sd.get("resampled_parquet_path")
+            if res_pq and os.path.exists(res_pq):
+                df_res_v = pd.read_parquet(res_pq, columns=["absolute_time", main_signal], engine="pyarrow")
+                res_t = to_unix_ms_local(df_res_v["absolute_time"])
+                res_y = pd.to_numeric(df_res_v[main_signal], errors="coerce").astype("float64").values
+                
+                # Filter manually to visible range
+                mask = (res_t >= x_min) & (res_t <= x_max)
+                res_t = res_t[mask]
+                res_y = res_y[mask]
+            else:
+                res_t = raw_t.copy()
+                res_y = raw_y.copy()
             
         if len(res_t) > target_pts:
             res_t_ds, res_y = lttb_downsample(res_t.astype(np.float64), res_y, target_pts)
@@ -1108,6 +1358,7 @@ async def viewport_data(payload: dict):
         
         traces.extend(dbg_traces)
 
+        print_timing(f"[viewport] TOTAL  path={vp_path} pts={n_pts} main={main_signal}", mark0)
         return {
             "traces": traces,
             "is_full_resolution": n_pts <= target_pts,

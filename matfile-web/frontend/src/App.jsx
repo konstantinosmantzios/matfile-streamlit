@@ -1,8 +1,14 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { Activity, UploadCloud, Download, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Target, X, Info } from 'lucide-react';
 import Plot from 'react-plotly.js';
 import FilterSandbox from './components/FilterSandbox';
+
+// Memoized wrapper: skips Plotly's (heavy) re-render when props are unchanged,
+// e.g. when unrelated UI state (loading flags, memory badge) changes.
+const MemoPlot = React.memo(Plot);
+
+const PLOT_CONFIG = { responsive: true, scrollZoom: false, displayModeBar: true };
 
 const API_BASE_URL = 'http://localhost:8000/api';
 
@@ -275,6 +281,52 @@ function App() {
     }, VIEWPORT_DEBOUNCE_MS);
   }, [sessionId, analysisView]);
 
+  const handlePlotClick = useCallback((e) => {
+    if (editingTestIdx !== null && e.points && e.points.length > 0) {
+      const x = e.points[0].x;
+      const xMs = typeof x === 'number' ? x : new Date(x).getTime();
+      setDraftEndMarker(xMs);
+    }
+  }, [editingTestIdx]);
+
+  // Stable layout object — only recreated when a Plotly-relevant value actually
+  // changes, so MemoPlot can skip redundant full re-renders.
+  const plotLayout = useMemo(() => ({
+    autosize: true,
+    plot_bgcolor: 'transparent',
+    paper_bgcolor: 'transparent',
+    font: { color: 'var(--text-main)', family: 'var(--font-sans)' },
+    margin: { l: 45, r: 25, t: 30, b: 40 },
+    shapes: draftEndMarker ? [...layoutShapes, {
+      type: 'line',
+      x0: draftEndMarker, x1: draftEndMarker,
+      y0: 0, y1: 1,
+      xref: 'x', yref: 'paper',
+      line: { color: '#ea580c', width: 2, dash: 'dot' }
+    }] : layoutShapes,
+    annotations: layoutAnnotations,
+    xaxis: {
+      title: 'Time',
+      gridcolor: 'rgba(0,0,0,0.05)',
+      type: 'date',
+      ...(plotXRange && plotXRange.min && plotXRange.max ? { range: [plotXRange.min, plotXRange.max] } : { autorange: true })
+    },
+    yaxis: {
+      title: 'Amplitude',
+      gridcolor: 'rgba(0,0,0,0.05)',
+      ...(plotYRange ? { range: [plotYRange.min, plotYRange.max] } : { autorange: true })
+    },
+    showlegend: true,
+    legend: { orientation: 'h', y: 1.15, x: 0.5, xanchor: 'center' },
+    uirevision: plotRevision,
+  }), [layoutShapes, layoutAnnotations, plotXRange, plotYRange, plotRevision, draftEndMarker]);
+
+  const plotStyle = useMemo(() => ({
+    width: '100%',
+    height: '620px',
+    cursor: editingTestIdx !== null ? 'crosshair' : 'default'
+  }), [editingTestIdx]);
+
   const jumpToTest = (targetIdx, buttonName = "Unknown") => {
     if (!analysisStats || analysisStats.length === 0) return;
     
@@ -340,6 +392,7 @@ function App() {
   const fetchViewport = async (xMinMs, xMaxMs, sid = sessionId) => {
     if (!sid) return;
     setIsViewportLoading(true);
+    const __t0 = performance.now();
     try {
       const response = await axios.post(`${API_BASE_URL}/viewport`, {
         session_id: sid,
@@ -347,6 +400,7 @@ function App() {
         x_max: xMaxMs,
         target_points: TARGET_POINTS,
       });
+      console.log(`[viewport] request ${(performance.now() - __t0).toFixed(0)} ms  traces=${response.data.traces.map(t => t.trace_id).join(',')}  pts=${response.data.visible_points}`);
       const viewportTraces = response.data.traces;
       const viewportIds = new Set(viewportTraces.map(t => t.trace_id));
       setPlotData(prev => {
@@ -439,9 +493,11 @@ function App() {
     if (!sid) return;
     setIsLoading(true);
     setError('');
+    const __t0 = performance.now();
     try {
       const payloadOverrides = Object.keys(overrides).length > 0 ? overrides : undefined;
       const response = await axios.post(`${API_BASE_URL}/process`, { session_id: sid, settings: currentSettings, end_marker_overrides: payloadOverrides });
+      console.log(`[process] ${currentSettings.selectedSignal}  round-trip ${(performance.now() - __t0).toFixed(0)} ms  traces=${(response.data.filtering_traces || []).map(t => t.trace_id).join(',')}`);
       backendDataRef.current = response.data;
       
       const traces = analysisView === 'Filtering Preview' ? (response.data.filtering_traces || []) : (response.data.analysis_traces || []);
@@ -497,6 +553,15 @@ function App() {
   };
 
   // ---- Export & Clear --------------------------------------------------
+  const handleSignalSelect = (sig) => {
+    if (sig === settings.selectedSignal || !latestSessionIdRef.current) return;
+    // Bypass the 600ms settings debounce: request the switch immediately.
+    // The backend serves it from the per-signal trace cache (no reprocessing).
+    skipNextSettingsEffectRef.current = true;
+    setSettings(prev => ({ ...prev, selectedSignal: sig }));
+    processData(latestSessionIdRef.current, { ...settings, selectedSignal: sig });
+  };
+
   const exportData = async () => {
     if (!sessionId) return;
     setIsExporting(true);
@@ -908,7 +973,7 @@ function App() {
                       return (
                         <button
                           key={sig}
-                          onClick={() => updateSetting('selectedSignal', sig)}
+                          onClick={() => handleSignalSelect(sig)}
                           style={{
                             padding: '6px 16px', borderRadius: '20px', fontSize: '13px', fontWeight: '600', cursor: 'pointer', border: '1px solid',
                             borderColor: isSelected ? 'var(--accent-blue)' : 'var(--border-color)',
@@ -1083,49 +1148,15 @@ function App() {
               {plotData.length > 0 ? (
                 <div style={{ width: '100%', display: 'flex', flexDirection: 'row', gap: 24 }}>
                   <div ref={plotContainerRef} style={{ flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column' }}>
-                    <Plot
-                    data={plotData}
-                    layout={{
-                      autosize: true,
-                      plot_bgcolor: 'transparent',
-                      paper_bgcolor: 'transparent',
-                      font: { color: 'var(--text-main)', family: 'var(--font-sans)' },
-                      margin: { l: 45, r: 25, t: 30, b: 40 },
-                      shapes: draftEndMarker ? [...layoutShapes, {
-                        type: 'line',
-                        x0: draftEndMarker, x1: draftEndMarker,
-                        y0: 0, y1: 1,
-                        xref: 'x', yref: 'paper',
-                        line: { color: '#ea580c', width: 2, dash: 'dot' }
-                      }] : layoutShapes,
-                      annotations: layoutAnnotations,
-                      xaxis: { 
-                        title: 'Time', 
-                        gridcolor: 'rgba(0,0,0,0.05)', 
-                        type: 'date',
-                        ...(plotXRange && plotXRange.min && plotXRange.max ? { range: [plotXRange.min, plotXRange.max] } : { autorange: true })
-                      },
-                      yaxis: { 
-                        title: 'Amplitude', 
-                        gridcolor: 'rgba(0,0,0,0.05)',
-                        ...(plotYRange ? { range: [plotYRange.min, plotYRange.max] } : { autorange: true })
-                      },
-                      showlegend: true,
-                      legend: { orientation: 'h', y: 1.15, x: 0.5, xanchor: 'center' },
-                      uirevision: plotRevision,
-                    }}
-                    config={{ responsive: true, scrollZoom: false, displayModeBar: true }}
-                    onRelayout={handleRelayout}
-                    onClick={(e) => {
-                      if (editingTestIdx !== null && e.points && e.points.length > 0) {
-                        const x = e.points[0].x;
-                        const xMs = typeof x === 'number' ? x : new Date(x).getTime();
-                        setDraftEndMarker(xMs);
-                      }
-                    }}
-                    useResizeHandler={true}
-                    style={{ width: '100%', height: '620px', cursor: editingTestIdx !== null ? 'crosshair' : 'default' }}
-                  />
+                    <MemoPlot
+                      data={plotData}
+                      layout={plotLayout}
+                      config={PLOT_CONFIG}
+                      onRelayout={handleRelayout}
+                      onClick={handlePlotClick}
+                      useResizeHandler={true}
+                      style={plotStyle}
+                    />
                   </div>
                   {/* Right: Stats Table or Placeholder */}
                   {analysisView === 'Supine to Standing Analysis' && (
