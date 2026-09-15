@@ -265,9 +265,11 @@ def process_session_data(df_raw, df_channel_info, df_comments, settings, preview
                 "uses_estimate": hr_used_est,
             }
 
-# Store smoothed HR back into df_sorted so it can be plotted
         if "5: HR" in df_sorted.columns:
-            df_sorted["5: HR"] = hr_smoothed.astype('float32')
+            # Actual signal fed into the peak-detection algorithm (Hampel spike
+            # removal + ~5 s rolling-median). Kept separate from the raw HR so the
+            # plot can show both; the raw channel is never overwritten.
+            df_sorted["_hr_for_peaks"] = hr_smoothed.astype('float32')
 
         block_ids = df_sorted["segment_id"].values
         unique_blocks = np.unique(block_ids)

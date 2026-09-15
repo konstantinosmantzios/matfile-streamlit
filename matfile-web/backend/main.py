@@ -24,6 +24,8 @@ import pyarrow.parquet as pq
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.background import BackgroundTasks
+from starlette.concurrency import run_in_threadpool
+import threading
 
 from processing import (
     channel_info_df,
@@ -116,26 +118,20 @@ def _build_signal_filtering_traces(sig, raw_df, df_sorted, result_df, raw_t, raw
     if sig not in df_sorted.columns:
         return traces
     is_hr = "HR" in sig
-    filt_y = pd.to_numeric(df_sorted[sig], errors="coerce").astype("float64").values
+    # For HR, the peak-detection algorithm runs on a smoothed version of the
+    # signal (Hampel spike removal + ~5 s rolling-median). We plot that as the
+    # "filtered / peak-detection" line so the user sees exactly what feeds the
+    # beat-peak detection, while the raw HR channel stays untouched.
+    if is_hr and "_hr_for_peaks" in df_sorted.columns:
+        filt_y = pd.to_numeric(df_sorted["_hr_for_peaks"], errors="coerce").astype("float64").values
+        filt_name = "HR Peak-Detection Filter"
+    else:
+        filt_y = pd.to_numeric(df_sorted[sig], errors="coerce").astype("float64").values
+        filt_name = "Filtered Data"
     if raw_df is not None and sig in raw_df.columns:
         raw_y = pd.to_numeric(raw_df[sig], errors="coerce").astype("float64").values
     else:
         raw_y = filt_y
-
-    if is_hr:
-        # HR: only the smoothed signal is meaningful (not beat-resampled)
-        hr_t_ds, hr_y_ds = lttb_downsample(raw_t_f64, filt_y, target_pts)
-        hr_t_ds, hr_y_ds = insert_gaps(hr_t_ds, hr_y_ds)
-        traces.append({
-            "trace_id": "filtered",
-            "x": _nan_safe_list(hr_t_ds, 0),
-            "y": _nan_safe_list(hr_y_ds),
-            "type": "scattergl", "mode": "lines",
-            "name": "HR (smoothed)",
-            "line": {"color": "#f97316", "width": 2},
-            "connectgaps": False,
-        })
-        return traces
 
     raw_t_ds, raw_y_ds = lttb_downsample(raw_t_f64, raw_y, target_pts)
     filt_t_ds, filt_y_ds = lttb_downsample(raw_t_f64, filt_y, target_pts)
@@ -156,7 +152,7 @@ def _build_signal_filtering_traces(sig, raw_df, df_sorted, result_df, raw_t, raw
         "x": _nan_safe_list(filt_t_ds, 0),
         "y": _nan_safe_list(filt_y_ds),
         "type": "scattergl", "mode": "lines",
-        "name": "Filtered Data",
+        "name": filt_name,
         "line": {"color": "#38bdf8", "width": 1},
         "connectgaps": False,
     })
@@ -362,6 +358,80 @@ async def cleanup_endpoint(request: Request):
         _cleanup_session(sid)
     return {"status": "ok"}
 
+def _priority_signal_from_schema(schema_names):
+    starting_one = [c for c in schema_names if c.startswith("1:")]
+    if starting_one:
+        return starting_one[0]
+    for c in schema_names:
+        if "Finger Pressure" in c:
+            return c
+    for c in schema_names:
+        if ":" in c and not any(x in c for x in ["MAP", "Systolic", "Diastolic"]):
+            return c
+    return ""
+
+def _prewarm_session(session_id):
+    """Kick off the default-settings pipeline so the user's first /api/process
+    hits the FULL in-memory cache path. Runs in a background thread."""
+    try:
+        sd = SESSION_STORE.get(session_id)
+        if not sd:
+            return
+        tests = sd.get("tests") or []
+        if not tests:
+            return
+        t0 = tests[0]
+        start_s = t0.get("start_s", 0)
+        end_s = t0.get("end_s", start_s + 1)
+
+        raw_pq = sd["raw_parquet_path"]
+        try:
+            schema = pq.read_schema(raw_pq)
+            signals = [c for c in schema.names if ":" in c and not any(x in c for x in ["MAP", "Systolic", "Diastolic"])]
+            main_signal = _priority_signal_from_schema(schema.names)
+        except Exception:
+            signals = []
+            main_signal = ""
+
+        if not main_signal and signals:
+            main_signal = signals[0]
+        if not main_signal:
+            return
+
+        settings = {
+            "resampleMode": "Beat-based",
+            "resampleRateTime": 1,
+            "resampleRateBeat": 5,
+            "autoCalOption": "Auto-Detect",
+            "fpFilter": "None",
+            "fpSavgolWin": 51,
+            "fpSavgolPoly": 5,
+            "fpButterCutoff": 5.0,
+            "fpButterOrder": 4,
+            "fpHampelWin": 5,
+            "fpHampelSig": 3.0,
+            "cbfFilter": "None",
+            "cbfSavgolWin": 51,
+            "cbfSavgolPoly": 5,
+            "cbfButterCutoff": 5.0,
+            "cbfButterOrder": 4,
+            "cbfHampelWin": 5,
+            "cbfHampelSig": 3.0,
+            "analysisBaselineWindow": 30,
+            "baselineEndComment": "Transition",
+            "analysisEndMarkerWindow": 10,
+            "useMapGaussianForStats": False,
+            "analysisView": "Filtering Preview",
+            "testStartS": start_s,
+            "testEndS": end_s,
+            "selectedSignal": main_signal,
+        }
+        payload = {"session_id": session_id, "settings": settings}
+        _process_pipeline(session_id, payload)
+        print(f"[prewarm] session {session_id}: pipeline done for {main_signal}")
+    except Exception:
+        traceback.print_exc()
+
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...)):
     print_memory("Upload Start")
@@ -401,6 +471,7 @@ async def upload_file(file: UploadFile = File(...)):
             "created_at": time.time(),
             "plot_cache": None,
         }
+        threading.Thread(target=_prewarm_session, args=(session_id,), daemon=True).start()
         return {"session_id": session_id, "file_name": file.filename, "tests": tests}
         
     # --- .MAT Fallback Path ---
@@ -498,6 +569,8 @@ async def upload_file(file: UploadFile = File(...)):
         }
 
         print_memory("Upload Complete")
+
+        threading.Thread(target=_prewarm_session, args=(session_id,), daemon=True).start()
 
         return {
             "session_id": session_id,
@@ -615,29 +688,27 @@ async def convert_file(background_tasks: BackgroundTasks, file: UploadFile = Fil
 # ===================================================================
 #  POST  /api/process
 # ===================================================================
-@app.post("/api/process")
-async def process_data(payload: dict):
-    session_id = payload.get("session_id")
-    if not session_id or session_id not in SESSION_STORE:
-        raise HTTPException(status_code=404, detail="Session not found")
-
+def _process_pipeline(session_id: str, payload: dict) -> dict:
+    """Core process logic. Called by /api/process endpoint and by prewarm.
+    Returns the full response dict. May raise on fatal errors."""
     sd = SESSION_STORE[session_id]
-    raw_pq = sd["raw_parquet_path"]
-    df_comments = sd["df_comments"]
-    df_channel_info = sd["df_channel_info"]
+    lock = sd.setdefault("_pipeline_lock", threading.Lock())
+    with lock:
+        raw_pq = sd["raw_parquet_path"]
+        df_comments = sd["df_comments"]
+        df_channel_info = sd["df_channel_info"]
 
-    settings = payload.get("settings", {})
-    start_s = settings.get("testStartS")
-    end_s = settings.get("testEndS")
-    target_pts = settings.get("targetPoints", TARGET_POINTS_DEFAULT)
+        settings = payload.get("settings", {})
+        start_s = settings.get("testStartS")
+        end_s = settings.get("testEndS")
+        target_pts = settings.get("targetPoints", TARGET_POINTS_DEFAULT)
 
-    try:
         print_memory("Process Start")
         mark = mark0 = _timing_mark()
         path_label = "unknown"
 
         s_hash = _settings_hash(settings)
-        plot_cache = sd.get("plot_cache", {})
+        plot_cache = sd.get("plot_cache") or {}
         last_res = sd.get("last_process_result")
         
         main_signal = settings.get("selectedSignal", "")
@@ -651,7 +722,7 @@ async def process_data(payload: dict):
             
             b_win = abs(settings.get("analysisBaselineWindow", 30))
             e_win = settings.get("analysisEndMarkerWindow", 10)
-            use_b_area = settings.get("useBaselineArea", False)
+            use_b_area = False
             baseline_end_comment = settings.get("baselineEndComment", "Transition")
             
             # FAST PATH: Pull resampled data from memory instead of Parquet
@@ -679,7 +750,7 @@ async def process_data(payload: dict):
             viz_mark = _timing_mark()
             end_overrides = payload.get("end_marker_overrides", {})
             viz_key = (
-                main_signal, b_win, e_win, use_b_area, baseline_end_comment,
+                main_signal, s_hash, use_map_for_stats, b_win, e_win, use_b_area, baseline_end_comment,
                 json.dumps(end_overrides, sort_keys=True, default=str),
                 repr([(c.get("time_s"), c.get("comment_text"),
                        str(c.get("absolute_time"))) for c in comment_list]),
@@ -896,9 +967,12 @@ async def process_data(payload: dict):
             raw_t = to_unix_ms_local(df_sorted["absolute_time"])
             sd["cached_raw_t_ms"] = np.asarray(raw_t, dtype=np.int64)
             sd["cached_raw_n"] = int(len(df_sorted))
-        filt_y = pd.to_numeric(
-            df_sorted[main_signal], errors="coerce"
-        ).astype("float64").values
+        if "HR" in main_signal and "_hr_for_peaks" in df_sorted.columns:
+            # For HR the "filtered" line is the peak-detection-smoothed HR.
+            viewport_filt = df_sorted["_hr_for_peaks"]
+        else:
+            viewport_filt = df_sorted[main_signal]
+        filt_y = pd.to_numeric(viewport_filt, errors="coerce").astype("float64").values
 
         # ---- cache raw/filtered arrays in RAM for instant /api/viewport ----
         # df_sorted is already kept in memory (cached_df_sorted), so these are
@@ -976,7 +1050,6 @@ async def process_data(payload: dict):
         stats = []
 
         # --- 1. Filtering Preview Build (from per-signal cache) ---
-        is_hr_signal = "HR" in main_signal
         filtering_traces = list(stbs.get(main_signal) or [])
         if not filtering_traces:
             raw_df_src = sd.get("cached_raw_df", df_sorted)
@@ -1031,31 +1104,16 @@ async def process_data(payload: dict):
                 })
                 
         # --- 2. Supine-to-Standing Analysis Build ---
-        if is_hr_signal:
-            # Only the smoothed HR trace is meaningful (not beat-resampled)
-            hr_sm = pd.to_numeric(df_sorted[main_signal], errors="coerce").astype("float64").values
-            hr_ds_t, hr_ds_y = lttb_downsample(raw_t_f64, hr_sm, target_pts)
-            hr_ds_t, hr_ds_y = insert_gaps(hr_ds_t, hr_ds_y)
-            analysis_traces.append({
-                "trace_id": "filtered",
-                "x": _nan_safe_list(hr_ds_t, 0),
-                "y": _nan_safe_list(hr_ds_y),
-                "type": "scattergl", "mode": "lines",
-                "name": "HR (smoothed)",
-                "line": {"color": "#f97316", "width": 2},
-                "connectgaps": False,
-            })
-        else:
-            analysis_traces.append({
-                "trace_id": "resampled",
-                "x": _nan_safe_list(res_t, 0),
-                "y": _nan_safe_list(res_y),
-                "type": "scattergl", "mode": "lines+markers" if settings.get("resampleMode") == "Beat-based" else "lines",
-                "name": "Resampled Data",
-                "line": {"color": "#f97316", "width": 2},
-                "marker": {"size": 4} if settings.get("resampleMode") == "Beat-based" else None,
-                "connectgaps": False,
-            })
+        analysis_traces.append({
+            "trace_id": "resampled",
+            "x": _nan_safe_list(res_t, 0),
+            "y": _nan_safe_list(res_y),
+            "type": "scattergl", "mode": "lines+markers" if settings.get("resampleMode") == "Beat-based" else "lines",
+            "name": "Resampled Data",
+            "line": {"color": "#f97316", "width": 2},
+            "marker": {"size": 4} if settings.get("resampleMode") == "Beat-based" else None,
+            "connectgaps": False,
+        })
 
         use_map_for_stats = settings.get("useMapGaussianForStats", False)
         if not result_df.empty:
@@ -1088,14 +1146,14 @@ async def process_data(payload: dict):
         comment_list = df_comments.to_dict("records")
         b_win = abs(settings.get("analysisBaselineWindow", 30))
         e_win = settings.get("analysisEndMarkerWindow", 10)
-        use_b_area = settings.get("useBaselineArea", False)
+        use_b_area = False
         baseline_end_comment = settings.get("baselineEndComment", "Transition")
 
         viz_mark = _timing_mark()
         try:
             end_overrides = payload.get("end_marker_overrides", {})
             viz_key = (
-                main_signal, b_win, e_win, use_b_area, baseline_end_comment,
+                main_signal, s_hash, use_map_for_stats, b_win, e_win, use_b_area, baseline_end_comment,
                 json.dumps(end_overrides, sort_keys=True, default=str),
                 repr([(c.get("time_s"), c.get("comment_text"),
                        str(c.get("absolute_time"))) for c in comment_list]),
@@ -1157,6 +1215,16 @@ async def process_data(payload: dict):
         sd["last_process_result"] = res
         return res
 
+# ===================================================================
+#  POST  /api/process  (thin async wrapper around _process_pipeline)
+# ===================================================================
+@app.post("/api/process")
+async def process_data(payload: dict):
+    session_id = payload.get("session_id")
+    if not session_id or session_id not in SESSION_STORE:
+        raise HTTPException(status_code=404, detail="Session not found")
+    try:
+        return await run_in_threadpool(_process_pipeline, session_id, payload)
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
@@ -1223,22 +1291,27 @@ async def viewport_data(payload: dict):
 
             import pyarrow.parquet as pq
             existing_cols = pq.read_schema(raw_pq).names
+            proc_cols = pq.read_schema(proc_pq).names
 
             # read ONLY the needed columns for the visible range
+            # (for HR, the proc parquet stores the peak-detection-smoothed
+            #  signal in _hr_for_peaks; we plot that as the "filtered" line)
+            filt_col = "_hr_for_peaks" if ("HR" in main_signal and "_hr_for_peaks" in proc_cols) else main_signal
             cols = ["absolute_time", main_signal]
             if "Finger Pressure" in main_signal:
                 if "2: MAP" in existing_cols:
                     cols.append("2: MAP")
+            cols_filt = ["absolute_time", filt_col] if filt_col != main_signal else cols
 
             df_raw_v = pd.read_parquet(raw_pq, columns=cols, engine="pyarrow",
                                         filters=pq_filter)
-            df_filt_v = pd.read_parquet(proc_pq, columns=cols, engine="pyarrow",
+            df_filt_v = pd.read_parquet(proc_pq, columns=cols_filt, engine="pyarrow",
                                          filters=pq_filter)
 
             raw_t = to_unix_ms_local(df_raw_v["absolute_time"])
             raw_y = pd.to_numeric(df_raw_v[main_signal], errors="coerce").astype("float64").values
             filt_t = to_unix_ms_local(df_filt_v["absolute_time"])
-            filt_y = pd.to_numeric(df_filt_v[main_signal], errors="coerce").astype("float64").values
+            filt_y = pd.to_numeric(df_filt_v[filt_col], errors="coerce").astype("float64").values
 
             raw_map_v = None
             if "2: MAP" in df_raw_v.columns:
@@ -1309,7 +1382,7 @@ async def viewport_data(payload: dict):
                     "x": _nan_safe_list(ft, 0),
                     "y": _nan_safe_list(fy),
                     "type": "scattergl", "mode": "lines",
-                    "name": "Filtered Data",
+                    "name": "HR Peak-Detection Filter" if "HR" in main_signal else "Filtered Data",
                     "line": {"color": "#38bdf8", "width": 1},
                     "connectgaps": False,
                 }
@@ -1437,7 +1510,7 @@ async def export_data(payload: dict):
             comment_list = df_comments.to_dict("records")
             b_win = abs(settings.get("analysisBaselineWindow", 30))
             e_win = settings.get("analysisEndMarkerWindow", 10)
-            use_b_area = settings.get("useBaselineArea", False)
+            use_b_area = False
             baseline_end_comment = settings.get("baselineEndComment", "Transition")
             _, _, _, st = generate_analysis_viz(
                 s_name, x, y, t_dt,
@@ -1490,76 +1563,79 @@ async def export_data(payload: dict):
             all_stats["CBF_Res"] = _get_stats_for_arrays(cbf_sig, x_arr, y_arr, t_arr_dt)
             print("[DEBUG] got CBF_Res stats, length:", len(all_stats["CBF_Res"]))
 
-        print("[DEBUG] combined_stats starting...")
+        print("[DEBUG] building wide-format stats table...")
 
-        combined_stats = []
         num_tests = 0
         if all_stats:
             num_tests = max((len(v) for v in all_stats.values()), default=0)
 
-        for i in range(num_tests):
-            configurations = [
-                ("FP (Resampled)", "FP_Res"),
-                ("FP (MAP 5s)", "FP_MAP"),
-                ("CBF", "CBF_Res")
-            ]
+        method_groups = [
+            {
+                "label": "Method 1: Transition-to-End",
+                "color": "#EA580C",
+                "keys": [
+                    ("Duration (s)", "or_duration"),
+                    ("Drop (%)", "or_pct_drop"),
+                    ("Min", "or_min_val"),
+                    ("Area Below Curve (AUC)", "or_area_below"),
+                    ("Start Value", "or_trans_val"),
+                    ("End Value", "end_val"),
+                ],
+            },
+            {
+                "label": "Method 2: Stand-to-End",
+                "color": "#16A34A",
+                "keys": [
+                    ("Duration (s)", "gr_duration"),
+                    ("Drop (%)", "gr_pct_drop"),
+                    ("Min", "gr_min_val"),
+                    ("Area Below Curve (AUC)", "gr_area_below"),
+                    ("Start Value", "gr_stand_val"),
+                    ("End Value", "end_val"),
+                ],
+            },
+            {
+                "label": "Method 3: Baseline Recovery",
+                "color": "#2563EB",
+                "keys": [
+                    ("Duration (s)", "rec_duration"),
+                    ("Drop (%)", "rec_pct_drop"),
+                    ("Min", "rec_min_val"),
+                    ("Area Below Curve (AUC)", "rec_area"),
+                    ("Start Value", "baseline"),
+                    ("End Value", "rec_end_val"),
+                    ("Started In", "rec_started_in"),
+                ],
+            },
+        ]
 
-            for sig_label, key in configurations:
+        configurations = [
+            ("FP (Resampled)", "FP_Res"),
+            ("FP (MAP 5s)", "FP_MAP"),
+            ("CBF", "CBF_Res"),
+        ]
+
+        stats_data = []
+        for sig_label, key in configurations:
+            for i in range(num_tests):
                 if key not in all_stats or i >= len(all_stats[key]):
                     continue
                 stat = all_stats[key][i]
+                cells = [i + 1, sig_label]
+                for g in method_groups:
+                    for _col_name, k in g["keys"]:
+                        cells.append(stat.get(k))
+                stats_data.append(cells)
 
-                trans_dur = stat.get("transition_time")
-
-                # Row 1: Method 1 (Orange)
-                combined_stats.append({
-                    "Test ID": i + 1,
-                    "Signal": sig_label,
-                    "Method": "Method 1: Transition-to-End",
-                    "Transition Duration (s)": trans_dur,
-                    "Duration (s)": stat.get("or_duration"),
-                    "Drop (%)": stat.get("or_pct_drop"),
-                    "Min": stat.get("or_min_val"),
-                    "Area Above Curve (AUC)": stat.get("or_area_below"),
-                    "Start / Baseline Value": stat.get("or_trans_val"),
-                    "End Value": stat.get("end_val"),
-                    "Started In": None
-                })
-
-                # Row 2: Method 2 (Green)
-                combined_stats.append({
-                    "Test ID": i + 1,
-                    "Signal": sig_label,
-                    "Method": "Method 2: Standing-to-End",
-                    "Transition Duration (s)": trans_dur,
-                    "Duration (s)": stat.get("gr_duration"),
-                    "Drop (%)": stat.get("gr_pct_drop"),
-                    "Min": stat.get("gr_min_val"),
-                    "Area Above Curve (AUC)": stat.get("gr_area_below"),
-                    "Start / Baseline Value": stat.get("gr_stand_val"),
-                    "End Value": stat.get("end_val"),
-                    "Started In": None
-                })
-
-                # Row 3: Method 3 (Blue)
-                combined_stats.append({
-                    "Test ID": i + 1,
-                    "Signal": sig_label,
-                    "Method": "Method 3: Baseline Recovery",
-                    "Transition Duration (s)": trans_dur,
-                    "Duration (s)": stat.get("rec_duration"),
-                    "Drop (%)": stat.get("rec_pct_drop"),
-                    "Min": stat.get("rec_min_val"),
-                    "Area Above Curve (AUC)": stat.get("rec_area"),
-                    "Start / Baseline Value": stat.get("baseline"),
-                    "End Value": stat.get("rec_end_val"),
-                    "Started In": stat.get("rec_started_in")
-                })
-
-        print("[DEBUG] writing dataframe to excel...")
-        df_stats = pd.DataFrame(combined_stats)
-        if not df_stats.empty:
-            df_stats = df_stats.sort_values(by=["Signal", "Method", "Test ID"]).reset_index(drop=True)
+        all_cols = ["Test ID", "Signal"]
+        bands = [("Test Info", "#86868B", 0, 2)]
+        col_pos = 2
+        for g in method_groups:
+            n = len(g["keys"])
+            bands.append((g["label"], g["color"], col_pos, n))
+            for col_name, _k in g["keys"]:
+                all_cols.append(col_name)
+            col_pos += n
             
         filtered_settings = {}
         global_keys = [
@@ -1600,62 +1676,116 @@ async def export_data(payload: dict):
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             workbook = writer.book
             
-            # Apple-like styling formats
+            base_format_dict = {
+                'font_name': 'Helvetica Neue', 'font_size': 11,
+                'font_color': '#1D1D1F', 'valign': 'vcenter', 'align': 'center'
+            }
+            format_default = workbook.add_format(base_format_dict)
+
             header_format = workbook.add_format({
                 'font_name': 'Helvetica Neue', 'font_size': 11, 'bold': True,
                 'bg_color': '#F5F5F7', 'font_color': '#1D1D1F',
                 'bottom': 1, 'border_color': '#D2D2D7',
                 'align': 'center', 'valign': 'vcenter'
             })
-            
-            base_format_dict = {
-                'font_name': 'Helvetica Neue', 'font_size': 11,
-                'font_color': '#1D1D1F', 'valign': 'vcenter', 'align': 'center'
-            }
-            format_default = workbook.add_format(base_format_dict)
-            
-            # Method specific row background colors
-            format_m1 = workbook.add_format({**base_format_dict, 'bg_color': '#E8F2FF'}) # Light blue
-            format_m2 = workbook.add_format({**base_format_dict, 'bg_color': '#F3E8FF'}) # Light purple
-            format_m3 = workbook.add_format({**base_format_dict, 'bg_color': '#E8F5E9'}) # Light green
-            
-            # Signal specific colors
-            format_sig_fp = workbook.add_format({**base_format_dict, 'bg_color': '#FFEFE5', 'bold': True}) # Light orange
-            format_sig_cbf = workbook.add_format({**base_format_dict, 'bg_color': '#E5F6FF', 'bold': True}) # Light cyan
 
-            df_stats.to_excel(writer, sheet_name="Statistics", index=False)
-            worksheet = writer.sheets["Statistics"]
-            
-            # Overwrite header with style
-            for col_num, value in enumerate(df_stats.columns):
-                worksheet.write(0, col_num, value, header_format)
-                
-            # Write data rows with style
-            for row_num in range(len(df_stats)):
-                row_data = df_stats.iloc[row_num]
-                method = str(row_data["Method"])
-                signal = str(row_data["Signal"])
-                
-                if "Method 1" in method: row_fmt = format_m1
-                elif "Method 2" in method: row_fmt = format_m2
-                elif "Method 3" in method: row_fmt = format_m3
-                else: row_fmt = format_default
-                    
-                for col_num, value in enumerate(row_data):
-                    fmt = row_fmt
-                    if col_num == list(df_stats.columns).index("Signal"):
-                        if "FP" in signal or "Finger Pressure" in signal: fmt = format_sig_fp
-                        elif "CBF" in signal: fmt = format_sig_cbf
-                            
-                    if pd.isna(value):
-                        worksheet.write(row_num + 1, col_num, "", fmt)
+            # ---- Statistics sheet: two-row header, wide format ----
+            stats_ws = workbook.add_worksheet("Statistics")
+            stats_ws.set_tab_color('#EA580C')
+
+            group_fmt_neutral = workbook.add_format({
+                'font_name': 'Helvetica Neue', 'bold': True, 'font_size': 11,
+                'font_color': '#FFFFFF', 'bg_color': '#86868B',
+                'valign': 'vcenter', 'align': 'center',
+                'border': 1, 'border_color': '#FFFFFF',
+            })
+            sub_header_fmt = workbook.add_format({
+                'font_name': 'Helvetica Neue', 'bold': True, 'font_size': 10,
+                'font_color': '#1D1D1F', 'bg_color': '#F5F5F7',
+                'valign': 'vcenter', 'align': 'center',
+                'bottom': 2, 'bottom_color': '#D2D2D7',
+                'border_color': '#E5E5EA',
+            })
+            data_fmt = workbook.add_format({
+                **base_format_dict,
+                'border': 1, 'border_color': '#E5E5EA',
+            })
+            data_alt_fmt = workbook.add_format({
+                **base_format_dict, 'bg_color': '#F7F7FA',
+                'border': 1, 'border_color': '#E5E5EA',
+            })
+
+            # Write method-coloured group bands on row 0
+            for label, hex_color, start_col, span in bands:
+                fmt = group_fmt_neutral
+                if hex_color and hex_color != "#86868B":
+                    fmt = workbook.add_format({
+                        'font_name': 'Helvetica Neue', 'bold': True, 'font_size': 11,
+                        'font_color': '#FFFFFF', 'bg_color': hex_color,
+                        'valign': 'vcenter', 'align': 'center',
+                        'border': 1, 'border_color': '#FFFFFF',
+                    })
+                if span == 1:
+                    stats_ws.write(0, start_col, label, fmt)
+                else:
+                    stats_ws.merge_range(0, start_col, 0, start_col + span - 1, label, fmt)
+
+            # Write column names on row 1
+            for c, name in enumerate(all_cols):
+                stats_ws.write(1, c, name, sub_header_fmt)
+
+            # Write data rows with zebra banding by test
+            for r, cells in enumerate(stats_data):
+                row_fmt = data_fmt if (cells[0] % 2 == 1) else data_alt_fmt
+                for c, v in enumerate(cells):
+                    if v is None or (isinstance(v, float) and np.isnan(v)):
+                        stats_ws.write(r + 2, c, "", row_fmt)
                     else:
-                        worksheet.write(row_num + 1, col_num, value, fmt)
+                        stats_ws.write(r + 2, c, v, row_fmt)
 
-            for idx, col in enumerate(df_stats.columns):
-                worksheet.set_column(idx, idx, max(len(col) + 2, 12))
+            # Column widths
+            for c, name in enumerate(all_cols):
+                w = max(len(name) + 2, 13)
+                if name == "Signal":
+                    w = 16
+                elif name == "Started In":
+                    w = 18
+                stats_ws.set_column(c, c, w)
 
+            stats_ws.freeze_panes(2, 2)
+            if stats_data:
+                stats_ws.autofilter(1, 0, len(stats_data) + 1, len(all_cols) - 1)
+
+            # Legend
+            legend_row = len(stats_data) + 4
+            legend_title_fmt = workbook.add_format({
+                'font_name': 'Helvetica Neue', 'bold': True, 'font_size': 10,
+                'font_color': '#1D1D1F', 'valign': 'vcenter',
+            })
+            stats_ws.write(legend_row, 0, "Legend — method colours match the plot", legend_title_fmt)
+            legend_row += 1
+            for label, hex_color, _s, _n in bands[1:]:  # skip Test Info
+                cell_fmt = workbook.add_format({
+                    'font_name': 'Helvetica Neue', 'font_size': 10,
+                    'font_color': '#1D1D1F', 'valign': 'vcenter',
+                    'bg_color': hex_color, 'font_color': '#FFFFFF',
+                    'bold': True,
+                })
+                text_fmt = workbook.add_format({
+                    'font_name': 'Helvetica Neue', 'font_size': 10,
+                    'font_color': '#1D1D1F', 'valign': 'vcenter',
+                })
+                stats_ws.write(legend_row, 0, "  ", cell_fmt)
+                stats_ws.write(legend_row, 1, label, text_fmt)
+                legend_row += 1
+
+            # ---- Resampled_Data sheet ----
             df_res_clean = result_df.copy() if not result_df.empty else df_sorted.copy()
+
+            # Drop the raw sparse "comment" column — the authoritative comment
+            # text is merged back in below as comment_text.
+            if "comment" in df_res_clean.columns:
+                df_res_clean = df_res_clean.drop(columns=["comment"])
             
             # Merge comments into resampled data
             if not df_comments.empty and 'time_s' in df_comments.columns and 'comment_text' in df_comments.columns:
