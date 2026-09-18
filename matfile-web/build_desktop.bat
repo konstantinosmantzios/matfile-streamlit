@@ -102,6 +102,7 @@ cd /d "%BACKEND_DIR%"
 
 echo Installing backend dependencies...
 python -m pip install -r requirements.txt
+python -m pip install zstandard
 if errorlevel 1 (
     echo [Error] pip install failed.
     exit /b 1
@@ -111,7 +112,7 @@ if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 
 :: Execute Nuitka compilation for Windows
 python -m nuitka ^
-    --standalone ^
+    --onefile ^
     --windows-console-mode=disable ^
     --include-data-dir="%FRONTEND_DIR%\dist=frontend_dist" ^
     --include-package=uvicorn ^

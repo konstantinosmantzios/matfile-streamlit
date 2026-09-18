@@ -26,8 +26,8 @@ echo "[Step 1/3] Frontend build successful!"
 echo -e "\n[Step 2/3] Checking Nuitka compiler..."
 if ! python3 -m nuitka --version >/dev/null 2>&1; then
     echo "[Notice] Nuitka is not currently installed in the active Python environment."
-    echo "         Installing nuitka via pip..."
-    python3 -m pip install nuitka
+    echo "         Installing nuitka and zstandard via pip..."
+    python3 -m pip install nuitka zstandard
 fi
 
 echo "[Step 2/3] Using Nuitka: $(python3 -m nuitka --version 2>&1 | head -n 1)"
@@ -52,7 +52,7 @@ fi
 
 # Execute Nuitka compilation
 python3 -m nuitka \
-    --standalone \
+    --onefile \
     "${EXTRA_FLAGS[@]}" \
     --include-data-dir="$FRONTEND_DIR/dist=frontend_dist" \
     --include-package=uvicorn \

@@ -1,0 +1,65 @@
+name: Build Desktop Executable
+
+on:
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build Frontend
+        working-directory: ./matfile-web/frontend
+        run: |
+          npm install
+          npm run build
+
+      - name: Install Backend Dependencies
+        working-directory: ./matfile-web/backend
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install nuitka zstandard
+
+      - name: Build Executable with Nuitka
+        working-directory: ./matfile-web/backend
+        run: |
+          python -m nuitka `
+            --onefile `
+            --windows-console-mode=disable `
+            --include-data-dir="../frontend/dist=frontend_dist" `
+            --include-package=uvicorn `
+            --include-package=fastapi `
+            --include-package=starlette `
+            --include-package=pydantic `
+            --include-package=pyarrow `
+            --include-package=h5py `
+            --include-package=scipy `
+            --include-package=pandas `
+            --include-package=numpy `
+            --include-package=xlsxwriter `
+            --include-package=psutil `
+            --nofollow-import-to=torch `
+            --nofollow-import-to=matplotlib `
+            --nofollow-import-to=IPython `
+            --nofollow-import-to=pytest `
+            --output-dir="../dist_desktop" `
+            desktop.py
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Matfile-Web-Windows-EXE
+          path: ./matfile-web/dist_desktop/desktop.exe
