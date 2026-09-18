@@ -52,7 +52,7 @@ fi
 
 # Execute Nuitka compilation
 python3 -m nuitka \
-    --onefile \
+    --standalone \
     "${EXTRA_FLAGS[@]}" \
     --include-data-dir="$FRONTEND_DIR/dist=frontend_dist" \
     --include-package=uvicorn \

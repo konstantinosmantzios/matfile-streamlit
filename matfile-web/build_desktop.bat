@@ -112,7 +112,7 @@ if not exist "%OUTPUT_DIR%" mkdir "%OUTPUT_DIR%"
 
 :: Execute Nuitka compilation for Windows
 python -m nuitka ^
-    --onefile ^
+    --standalone ^
     --windows-console-mode=disable ^
     --include-data-dir="%FRONTEND_DIR%\dist=frontend_dist" ^
     --include-package=uvicorn ^

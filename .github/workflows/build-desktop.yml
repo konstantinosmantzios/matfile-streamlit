@@ -38,7 +38,7 @@ jobs:
         run: |
           python -m nuitka `
             --assume-yes-for-downloads `
-            --onefile `
+            --standalone `
             --windows-console-mode=disable `
             --include-data-dir="../frontend/dist=frontend_dist" `
             --include-package=uvicorn `
@@ -64,5 +64,5 @@ jobs:
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Matfile-Web-Windows-EXE
-          path: ./matfile-web/dist_desktop/desktop.exe
+          name: Matfile-Web-Windows
+          path: ./matfile-web/dist_desktop/desktop.dist/
