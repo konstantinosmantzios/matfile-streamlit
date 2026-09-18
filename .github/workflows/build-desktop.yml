@@ -37,6 +37,7 @@ jobs:
         working-directory: ./matfile-web/backend
         run: |
           python -m nuitka `
+            --assume-yes-for-downloads `
             --onefile `
             --windows-console-mode=disable `
             --include-data-dir="../frontend/dist=frontend_dist" `
