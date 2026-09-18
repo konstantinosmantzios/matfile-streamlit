@@ -66,7 +66,6 @@ python3 -m nuitka \
     --include-package=numpy \
     --include-package=xlsxwriter \
     --include-package=psutil \
-    --include-package=webview \
     --include-package=multipart \
     --include-package=tzlocal \
     --nofollow-import-to=torch \
