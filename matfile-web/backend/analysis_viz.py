@@ -3,13 +3,30 @@ import numpy as np
 
 
 def _to_ms(t_val):
-    import tzlocal
-    local_tz = tzlocal.get_localzone_name()
     if pd.isna(t_val):
         return None
+    try:
+        import tzlocal
+        local_tz = tzlocal.get_localzone_name()
+    except Exception:
+        local_tz = "UTC"
+
+    is_raw_numeric = isinstance(t_val, (int, float, np.integer, np.floating))
     s = pd.to_datetime(pd.Series([t_val]))
+
+    if is_raw_numeric and len(s) > 0 and s.dt.year.iloc[0] == 1970:
+        raw_ints = s.astype("int64").values
+        if np.abs(raw_ints[0]) > 1e14:
+            return int(raw_ints[0] // 1_000)
+        else:
+            return int(raw_ints[0])
+
     if s.dt.tz is None:
-        s = s.dt.tz_localize(local_tz)
+        try:
+            s = s.dt.tz_localize(local_tz)
+        except Exception:
+            s = s.dt.tz_localize("UTC")
+            
     return int(s.astype("int64").values[0] // 1_000_000)
 
 

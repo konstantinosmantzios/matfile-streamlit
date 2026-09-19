@@ -100,18 +100,40 @@ def _nan_safe_list(arr, decimals=2):
     return lst
 
 def to_unix_ms_local(series: pd.Series) -> np.ndarray:
-    import tzlocal
-    local_tz = tzlocal.get_localzone_name()
-    # Force to datetime in case it's an object/string type
+    try:
+        import tzlocal
+        local_tz = tzlocal.get_localzone_name()
+    except Exception:
+        local_tz = "UTC"
+
+    # In some Nuitka builds, PyArrow loses datetime metadata and loads as int64 (microseconds or ms)
+    # pd.to_datetime() will interpret these raw integers as nanoseconds, resulting in year 1970.
+    is_raw_numeric = pd.api.types.is_numeric_dtype(series)
+    
     series = pd.to_datetime(series)
+    
+    # If it was parsed as 1970 but the original was numeric, it's the PyArrow bug.
+    if is_raw_numeric and len(series) > 0 and series.dt.year.iloc[0] == 1970:
+        raw_ints = series.astype("int64").values
+        # If raw_ints is in microseconds (e.g. 1.7e15), divide by 1_000 to get ms
+        # If raw_ints is in milliseconds (e.g. 1.7e12), use it directly
+        if np.abs(raw_ints[0]) > 1e14:  # microseconds
+            return raw_ints // 1_000
+        else:
+            return raw_ints
+
     if series.dt.tz is None:
-        series = series.dt.tz_localize(local_tz)
+        try:
+            series = series.dt.tz_localize(local_tz)
+        except Exception:
+            series = series.dt.tz_localize("UTC")
+            
     return series.astype("int64").values // 1_000_000
 
 def single_to_unix_ms_local(val):
     if pd.isna(val):
         return None
-    return int(to_unix_ms_local(pd.to_datetime(pd.Series([val])))[0])
+    return int(to_unix_ms_local(pd.Series([val]))[0])
 
 def _build_signal_filtering_traces(sig, raw_df, df_sorted, result_df, raw_t, raw_t_f64,
                                    target_pts, peaks, peaks_cbf, settings, resampled_t_ms):
